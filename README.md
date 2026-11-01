@@ -3,6 +3,13 @@
 在文件资源管理器里把光标停在某个文件上 **300ms**，Seer 自动弹出预览；光标移开自动收起。
 不模拟按键、不改 Seer 本体，走的是 Seer 官方 SDK 的 IPC（`WM_COPYDATA`）。
 
+## 下载
+
+安装包只在 [**Releases**](https://github.com/lza0312/SeerHover/releases/latest) 发布：
+`SeerHover.exe` 单文件（328 KB，需 .NET 8 桌面运行时），下载后放到任意目录双击即可，无需安装。
+
+本仓库只放源码 —— `dist/` 是本地构建产物，已加入 `.gitignore`，不再入库。
+
 ---
 
 ## 为什么不是 Seer 插件
@@ -74,7 +81,7 @@ Seer 有个选项 **Track selected file in Explorer**（`uwp.ini` 里的 `tracki
 
 ```text
 1. 确保 Seer 正在运行（托盘里有图标）
-2. 双击 dist\SeerHover.exe        ← 启动后常驻托盘，无主窗口
+2. 双击 SeerHover.exe（从 Releases 下载）   ← 启动后常驻托盘，无主窗口
 3. 打开资源管理器，把鼠标停在某个文件上 0.3 秒
 ```
 
@@ -237,7 +244,7 @@ dotnet publish -c Release -r win-x64 --self-contained false `
 
 ```
 seer-hover/
-├─ dist/                    # 发布产物：SeerHover.exe + 运行时生成的 config.json
+├─ dist/                    # 本地构建产物（不入库）：publish 输出的 SeerHover.exe + 运行时生成的 config.json
 ├─ src/SeerHover/
 │  ├─ Program.cs            # 入口（单实例、崩溃兜底、启动托盘）
 │  ├─ Cli.cs                # 命令行诊断命令（--status / --items / --bench …）
