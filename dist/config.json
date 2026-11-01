@@ -1,0 +1,33 @@
+{
+  "Enabled": true,
+  "DwellMs": 200,
+  "HideGraceMs": 200,
+  "PollMs": 50,
+  "MinInvokeIntervalMs": 220,
+  "PreviewFolders": false,
+  "SuppressOnModifiers": true,
+  "ExcludeExtensions": [],
+  "ExcludePaths": [],
+  "HideOnClick": true,
+  "VerifyPreview": true,
+  "VerifyDelayMs": 700,
+  "VerboseLog": false,
+  "DarkMode": true,
+  "UiScale": 105,
+  "SettingsWidth": 1176,
+  "SettingsHeight": 1352,
+  "Geometry": {
+    "Mode": "cursor",
+    "SizeMode": "auto",
+    "AvoidCursor": true,
+    "Width": 1260,
+    "Height": 2160,
+    "Gap": 28,
+    "X": 200,
+    "Y": 200,
+    "Corner": "bottomright",
+    "Margin": 4,
+    "MaxScreenRatio": 1
+  },
+  "DoubleClickUp": true
+}
