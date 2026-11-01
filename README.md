@@ -257,3 +257,7 @@ seer-hover/
 │  └─ AppConfig.cs          # 配置模型
 └─ tools/SmokeTest/         # 最小 IPC 冒烟测试（验证 Seer 能否被唤起）
 ```
+
+## 许可
+
+MIT License，见 [LICENSE](LICENSE)。
