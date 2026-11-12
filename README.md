@@ -240,11 +240,48 @@ dotnet publish -c Release -r win-x64 --self-contained false `
   -p:DebugType=none -o ..\..\dist
 ```
 
+## 开发与发布
+
+```powershell
+# 构建 + 单文件发布到 dist\（版本号会写进程序集）
+powershell -ExecutionPolicy Bypass -File .\tools\build.ps1 -Version 1.0.1
+
+# 只编译不发布
+powershell -ExecutionPolicy Bypass -File .\tools\build.ps1 -NoPublish
+```
+
+`-ExecutionPolicy Bypass` 只对这次进程生效，不修改系统策略（本机默认禁止运行 .ps1）。
+若想长期直接运行 `.\tools\build.ps1`，自行执行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
+`dist/` 是本地构建产物，已被 `.gitignore` 排除；**安装包只在 [Releases](https://github.com/lza0312/SeerHover/releases/latest) 发布**，
+不要把 exe 提交进仓库。发布流程：`build.ps1` → 本地验证 → 打 tag 并用 `gh release create <tag> dist/SeerHover.exe` 上传资产 → 更新 `CHANGELOG.md`。
+
+推送代码：正常网络直接 `git push`。如果网络只放行 `api.github.com`（`git push` 报 `CONNECT tunnel failed`），用：
+
+```bash
+python tools/push-api.py -m "提交说明"
+```
+
+脚本用 Git Data API 从 `git ls-files` 构建 blobs/tree/commit，以**远端分支头**为父节点，**不依赖本地 git 历史**。
+因此本机与远端的提交 SHA 不同（历史分叉）是正常的，不会造成 non-fast-forward；二进制文件也能原样推送。
+凭据依次取 `--token` → `GITHUB_TOKEN` / `GH_TOKEN` → Git Credential Manager → `gh auth token`，权限需要 `repo`。
+**如果改动包含 `.github/workflows/*.yml`，凭据还需要 `workflow` scope** —— GitHub 会以 404 拒绝 `git/trees`（不是文件不存在），
+此时执行 `gh auth refresh -h github.com -s workflow`，或换用带 `repo + workflow` 的 PAT。
+若将来网络恢复想改回 `git push`，先 `git fetch origin && git reset --hard origin/main` 把本地历史对齐。
+
+CI：`.github/workflows/build.yml` 在 Windows Runner 上编译（`-warnaserror`）并上传 `SeerHover.exe` 产物，不自动发 Release。
+
 ## 目录结构
 
 ```
 seer-hover/
-├─ dist/                    # 本地构建产物（不入库）：publish 输出的 SeerHover.exe + 运行时生成的 config.json
+├─ .github/workflows/build.yml  # CI：编译校验 + 产物上传
+├─ CHANGELOG.md                # 版本记录
+├─ LICENSE                     # MIT
+├─ tools/
+│  ├─ build.ps1                # 构建 / 单文件发布（可注入版本号）
+│  ├─ push-api.py              # 只放行 api.github.com 时的推送通道
+│  └─ SmokeTest/               # 最小 IPC 冒烟测试（验证 Seer 能否被唤起）
 ├─ src/SeerHover/
 │  ├─ Program.cs            # 入口（单实例、崩溃兜底、启动托盘）
 │  ├─ Cli.cs                # 命令行诊断命令（--status / --items / --bench …）
@@ -261,8 +298,9 @@ seer-hover/
 │  ├─ ExplorerUp.cs         # 资源管理器空白处双击 → Alt+↑（鼠标钩子 + 空白判定）
 │  ├─ MediaSize.cs          # 图片/视频原始尺寸探测（WIC + Shell 属性，带缓存）
 │  ├─ TrayHost.cs           # 托盘与菜单
-│  └─ AppConfig.cs          # 配置模型
-└─ tools/SmokeTest/         # 最小 IPC 冒烟测试（验证 Seer 能否被唤起）
+│  ├─ AppConfig.cs          # 配置模型
+│  └─ ...                   # 详见源码中的分区注释
+└─ dist/                    # 本地构建产物（不入库）：SeerHover.exe + 运行时生成的 config.json
 ```
 
 ## 许可

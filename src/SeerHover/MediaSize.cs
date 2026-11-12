@@ -5,7 +5,7 @@ namespace SeerHover;
 
 /// <summary>
 /// 取图片 / 视频的原始像素尺寸，用于「原比例最大化」定位。
-/// 图片走 WIC（只读头，不加载像素）；视频走 Shell 属性 System.Video.FrameWidth/Height。
+/// 图片常见格式走 GDI+ 读头，冷门格式（HEIC/WebP 等）退回 WIC；视频走 Shell 属性。
 ///
 /// 性能取舍：
 /// - 以前每次探测都新建一根 STA 线程 + 每次新建 Shell.Application（COM 实例 + 线程各 ~1-10ms，
@@ -202,10 +202,29 @@ internal static class MediaSize
             if (v.W > 0 && v.H > 0) return v;
         }
 
-        var img = WicSize(path);
+        var img = ImageSize(path);
         if (img.W > 0 && img.H > 0) return img;
 
         return ShellSize(path, "System.Image.HorizontalSize", "System.Image.VerticalSize", ref shell);
+    }
+
+    /// <summary>
+    /// 先用 GDI+ 只读头（PNG/JPEG/GIF/BMP/TIFF），命中就不加载 WPF/WIC 那套程序集；
+    /// GDI+ 不认识的格式再退回 WIC，保证 HEIC/WebP 这类依赖系统编解码器的格式仍能取到尺寸。
+    /// </summary>
+    private static (int W, int H) ImageSize(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var img = System.Drawing.Image.FromStream(fs,
+                useEmbeddedColorManagement: false, validateImageData: false);
+            if (img.Width > 0 && img.Height > 0) return (img.Width, img.Height);
+        }
+        catch { }
+
+        return WicSize(path);
     }
 
     private static (int W, int H) WicSize(string path)

@@ -6,17 +6,37 @@ namespace SeerHover;
 
 internal static class Program
 {
-    [STAThread]
-    private static void CrashLog(string source, Exception? ex)
-    {
-        try
+    /// <summary>诊断命令表。新增命令只改这张表，入口不再维护一长串 switch。</summary>
+    private static Dictionary<string, Func<int>> Commands(string[] args) =>
+        new(StringComparer.OrdinalIgnoreCase)
         {
-            string p = Path.Combine(Path.GetTempPath(), "seerhover-crash.log");
-            File.AppendAllText(p, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {source}\n{ex}\n\n");
-        }
-        catch { }
-    }
+            ["--probe"] = () => Cli.Run(Cli.Probe, "probe"),
+            ["--selftest"] = () => Cli.Run(Cli.SelfTest, "selftest"),
+            ["--diag"] = () => Cli.Run(Cli.Diag, "diag"),
+            ["--uia-tree"] = () => Cli.Run(Cli.UiaTree, "uiatree"),
+            ["--geom-probe"] = () => Cli.Run(() => Cli.GeomProbe(args), "geomprobe"),
+            ["--geom-monitor"] = () => Cli.Run(Cli.GeomMonitor, "geommon"),
+            ["--e2e"] = () => Cli.Run(Cli.E2E, "e2e"),
+            ["--e2e-selected"] = () => Cli.Run(Cli.E2ESelected, "e2esel"),
+            ["--status"] = () => Cli.Run(Cli.Status, "status"),
+            ["--items"] = () => Cli.Run(Cli.Items, "items"),
+            ["--ipc"] = () => Cli.Run(() => Cli.IpcTest(args.Length > 1 ? args[1] : null), "ipc"),
+            ["--media"] = () => Cli.Run(() => Cli.MediaInfo(args.Length > 1 ? args[1] : null), "media"),
+            ["--windows"] = () => Cli.Run(Cli.SeerWindows, "windows"),
+            ["--fix-tracking"] = () => Cli.Run(Cli.FixTracking, "fixtracking"),
+            ["--keep-window"] = () => Cli.Run(Cli.KeepWindow, "keepwindow"),
+            ["--restore-window"] = () => Cli.Run(Cli.RestoreWindow, "restorewindow"),
+            ["--restore-tracking"] = () => Cli.Run(Cli.RestoreTracking, "restore"),
+            ["--track"] = () => Cli.Run(() => Cli.TrackTest(args.Length > 1 ? args[1] : "once"), "track"),
+            ["--install-startup"] = () => Cli.Run(Cli.InstallStartup, "install"),
+            ["--uninstall-startup"] = () => Cli.Run(Cli.UninstallStartup, "uninstall"),
+            ["--menu-test"] = () => Cli.Run(() => MenuTest(args), "menutest"),
+            ["--up-probe"] = () => Cli.Run(() => Cli.UpProbe(args), "upprobe"),
+            ["--bench"] = () => Cli.Run(() => Cli.Bench(args), "bench"),
+            ["--hide"] = () => Cli.Run(Cli.HideSeer, "hide"),
+        };
 
+    [STAThread]
     private static int Main(string[] args)
     {
         // 必须在任何窗口/坐标调用之前设置
@@ -25,36 +45,12 @@ internal static class Program
         if (args.Length > 0)
         {
             Native.AttachParentConsole();
-            switch (args[0].ToLowerInvariant())
-            {
-                case "--probe": return Cli.Run(Cli.Probe, "probe");
-                case "--selftest": return Cli.Run(Cli.SelfTest, "selftest");
-                case "--diag": return Cli.Run(Cli.Diag, "diag");
-                case "--uia-tree": return Cli.Run(Cli.UiaTree, "uiatree");
-                case "--geom-probe": return Cli.Run(() => Cli.GeomProbe(args), "geomprobe");
-                case "--geom-monitor": return Cli.Run(Cli.GeomMonitor, "geommon");
-                case "--e2e": return Cli.Run(Cli.E2E, "e2e");
-                case "--e2e-selected": return Cli.Run(Cli.E2ESelected, "e2esel");
-                case "--status": return Cli.Run(Cli.Status, "status");
-                case "--items": return Cli.Run(Cli.Items, "items");
-                case "--ipc": return Cli.Run(() => Cli.IpcTest(args.Length > 1 ? args[1] : null), "ipc");
-                case "--media": return Cli.Run(() => Cli.MediaInfo(args.Length > 1 ? args[1] : null), "media");
-                case "--windows": return Cli.Run(Cli.SeerWindows, "windows");
-                case "--fix-tracking": return Cli.Run(Cli.FixTracking, "fixtracking");
-                case "--keep-window": return Cli.Run(Cli.KeepWindow, "keepwindow");
-                case "--restore-window": return Cli.Run(Cli.RestoreWindow, "restorewindow");
-                case "--restore-tracking": return Cli.Run(Cli.RestoreTracking, "restore");
-                case "--track": return Cli.Run(() => Cli.TrackTest(args.Length > 1 ? args[1] : "once"), "track");
-                case "--install-startup": return Cli.Run(Cli.InstallStartup, "install");
-                case "--uninstall-startup": return Cli.Run(Cli.UninstallStartup, "uninstall");
-                case "--menu-test": return Cli.Run(() => MenuTest(args), "menutest");
-                case "--up-probe": return Cli.Run(() => Cli.UpProbe(args), "upprobe");
-                case "--bench": return Cli.Run(() => Cli.Bench(args), "bench");
-                case "--hide": return Cli.Run(Cli.HideSeer, "hide");
-            }
+            if (Commands(args).TryGetValue(args[0], out var run)) return run();
         }
 
-        using var mutex = new Mutex(true, "SeerHover.SingleInstance", out bool created);
+        // 会话隔离：同一台机器不同登录会话各自跑一份，不会互相误判成「已在运行」
+        string mutexName = @"Local\SeerHover.SingleInstance." + Process.GetCurrentProcess().SessionId;
+        using var mutex = new Mutex(true, mutexName, out bool created);
         if (!created)
         {
             MessageBox.Show("SeerHover 已在运行（见系统托盘）。", "SeerHover",
@@ -67,15 +63,15 @@ internal static class Program
         var cfg = AppConfig.LoadOrCreate();
         Logger.Init(cfg.VerboseLog);
 
-        // 崩溃兜底：托盘进程没有控制台，异常必须落盘才看得到
+        // 崩溃兜底：托盘进程没有控制台，异常必须落盘才看得到；与正常日志同目录，方便排查
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
-            CrashLog("AppDomain", e.ExceptionObject as Exception);
+            Logger.Crash("AppDomain", e.ExceptionObject as Exception);
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
-            CrashLog("Task", e.Exception);
+            Logger.Crash("Task", e.Exception);
             e.SetObserved();
         };
-        Application.ThreadException += (_, e) => CrashLog("UI", e.Exception);
+        Application.ThreadException += (_, e) => Logger.Crash("UI", e.Exception);
 
         // 注意：以前这里全局 TimeBeginPeriod(1)，会让整机 24 小时跑在 1ms 定时精度上（更耗电、唤醒更多）。
         // 现在只由 GeometryController 在「预览窗口定位」那几百毫秒内临时提高精度。

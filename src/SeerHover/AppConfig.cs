@@ -132,11 +132,12 @@ internal sealed class AppConfig
         return fresh;
     }
 
-    public void Save()
+    /// <summary>保存到 config.json。返回 false 表示落盘失败（调用方应提示用户，设置不会持久）。</summary>
+    public bool Save()
     {
         try
         {
-            if (string.IsNullOrEmpty(Path)) return;
+            if (string.IsNullOrEmpty(Path)) return false;
             string json = JsonSerializer.Serialize(this, Options);
 
             // 先写临时文件再替换：写一半崩掉也不会留下半个 config.json
@@ -151,10 +152,12 @@ internal sealed class AppConfig
                 try { File.Delete(tmp); } catch { }
                 File.WriteAllText(Path, json);
             }
+            return true;
         }
         catch (Exception ex)
         {
             Logger.Error("config save failed: " + ex.Message);
+            return false;
         }
     }
 

@@ -10,8 +10,11 @@ internal sealed class SettingsHost
     public Func<bool> IsStartupEnabled { get; set; } = () => false;
     public Action<bool> SetStartup { get; set; } = _ => { };
 
-    /// <summary>应用配置；第二个参数为 true 时不弹托盘气泡（「应用」按钮连续点按用）。</summary>
-    public Action<AppConfig, bool> Apply { get; set; } = (_, _) => { };
+    /// <summary>
+    /// 应用配置；第二个参数为 true 时不弹托盘气泡（「应用」按钮连续点按用）。
+    /// 返回 false 表示配置没能落盘，设置窗口会保持打开并提示用户。
+    /// </summary>
+    public Func<AppConfig, bool, bool> Apply { get; set; } = (_, _) => true;
 
     /// <summary>拖动「界面缩放」时的即时预览（不改配置，只换字体度量）。</summary>
     public Action<float> PreviewScale { get; set; } = _ => { };
@@ -366,11 +369,19 @@ internal sealed class SettingsForm : Form, IMessageFilter
         RebuildAll(0);
     }
 
-    /// <summary>应用按钮：写入并生效，窗口不关；确认按钮：写入 + 关闭。</summary>
+    /// <summary>应用按钮：写入并生效，窗口不关；确认按钮：写入 + 关闭。落盘失败时保持窗口打开。</summary>
     private void ApplySettings(bool close)
     {
         _work.Normalize();
-        _host.Apply(_work, !close);
+        if (!_host.Apply(_work, !close))
+        {
+            MessageBox.Show(this,
+                "设置已在本次运行中生效，但写入 config.json 失败，重启后会丢失。\n" +
+                "请检查程序目录是否可写（或是否被只读/权限策略限制），然后重试。\n\n" +
+                "详细原因见托盘菜单「打开日志」。",
+                "SeerHover - 保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         if (close) Close();
     }
 

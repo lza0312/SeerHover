@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/SeerHover/SeerHover.csproj
+
+      - name: Build (warnings are errors)
+        run: dotnet build src/SeerHover/SeerHover.csproj -c Release --no-restore -warnaserror
+
+      - name: Publish single-file exe
+        run: >
+          dotnet publish src/SeerHover/SeerHover.csproj -c Release -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -o dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SeerHover
+          path: dist/SeerHover.exe
+          if-no-files-found: error

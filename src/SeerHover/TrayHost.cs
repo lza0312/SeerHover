@@ -42,6 +42,7 @@ internal sealed class TrayHost : ApplicationContext
         menu.Items.Add(_toggleItem);
         menu.Items.Add(new ToolStripMenuItem("重载配置", null, (_, _) => ReloadConfig()));
         menu.Items.Add(new ToolStripMenuItem("打开日志", null, (_, _) => OpenLog()));
+        menu.Items.Add(new ToolStripMenuItem("打开崩溃日志", null, (_, _) => OpenCrashLog()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("退出", null, (_, _) => ExitApp()));
 
@@ -65,6 +66,7 @@ internal sealed class TrayHost : ApplicationContext
 
         _controller.Start();
         Logger.Info("SeerHover started");
+        NotifyPreviousCrash();
 
         // Seer 配置检查放后台：即使 Seer 卡住（IPC 超时）也不拖慢托盘出现
         _ = Task.Run(() =>
@@ -73,6 +75,8 @@ internal sealed class TrayHost : ApplicationContext
             catch (Exception ex) { Logger.Error("startup tracking check: " + ex.Message); }
             try { EnsureKeepWindow(manual: false); }
             catch (Exception ex) { Logger.Error("startup keep-window check: " + ex.Message); }
+            try { EnsureStartupLinkTarget(); }
+            catch (Exception ex) { Logger.Error("startup link check: " + ex.Message); }
         });
 
         if (openSettings)
@@ -85,6 +89,24 @@ internal sealed class TrayHost : ApplicationContext
     }
 
     // ── 设置窗口 ────────────────────────────────────────────────────
+
+    /// <summary>上次异常退出时，启动后提示一次；崩溃记录已由 TakeCrashReport 归档，不会重复弹。</summary>
+    private void NotifyPreviousCrash()
+    {
+        string? report = Logger.TakeCrashReport();
+        if (report == null) return;
+        Logger.Error("previous crash report archived");
+        var t = new System.Windows.Forms.Timer { Interval = 1200 };
+        t.Tick += (_, _) =>
+        {
+            t.Stop();
+            t.Dispose();
+            _tray.ShowBalloonTip(9000, "SeerHover",
+                "检测到上次异常退出。崩溃记录已保存，可在托盘菜单「打开崩溃日志」查看。",
+                ToolTipIcon.Warning);
+        };
+        t.Start();
+    }
 
     /// <summary>深浅色 + 界面缩放一起套用。托盘菜单每次弹出前都会重新读，所以不用重启。</summary>
     private void ApplyTheme()
@@ -132,18 +154,27 @@ internal sealed class TrayHost : ApplicationContext
         }
     }
 
-    /// <summary>设置窗口点「应用 / 确认」后调用：整体替换配置 → 落盘 → 重启轮询。quiet = 不弹气泡。</summary>
-    private void ApplySettings(AppConfig next, bool quiet)
+    /// <summary>设置窗口点「应用 / 确认」后调用。返回 false 表示配置未落盘（设置窗会保持打开）。</summary>
+    private bool ApplySettings(AppConfig next, bool quiet)
     {
         _cfg.CopyFrom(next);
-        _cfg.Save();
+        bool saved = _cfg.Save();
         ApplyTheme();
         Logger.EnableVerbose(_cfg.VerboseLog);
         _controller.ForceHide();
         _controller.Restart();
         _toggleItem.Text = _controller.Paused ? "恢复悬停预览" : "暂停悬停预览";
         Logger.Info(quiet ? "settings applied (stay open)" : "settings applied");
+
+        if (!saved)
+        {
+            Logger.Error("settings apply: config.json write failed");
+            _tray.ShowBalloonTip(6000, "SeerHover",
+                "设置已生效，但 config.json 写入失败，重启后会丢失。", ToolTipIcon.Error);
+            return false;
+        }
         if (!quiet) _tray.ShowBalloonTip(1500, "SeerHover", "设置已保存并生效。", ToolTipIcon.Info);
+        return true;
     }
 
     /// <summary>设置窗口关闭时记住大小（只改这两项并落盘，不走重启轮询的完整生效流程）。</summary>
@@ -331,12 +362,64 @@ internal sealed class TrayHost : ApplicationContext
         catch (Exception ex) { Logger.Error("open log failed: " + ex.Message); }
     }
 
+    private void OpenCrashLog()
+    {
+        try
+        {
+            Directory.CreateDirectory(Logger.Directory);
+            string p = Logger.CrashLogPath;
+            string archived = p + ".1";
+            string show = File.Exists(p) ? p : (File.Exists(archived) ? archived : p);
+            if (!File.Exists(show)) File.WriteAllText(show, "（暂无崩溃记录）\n");
+            Process.Start(new ProcessStartInfo(show) { UseShellExecute = true });
+        }
+        catch (Exception ex) { Logger.Error("open crash log failed: " + ex.Message); }
+    }
+
     private static string StartupLink =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "SeerHover.lnk");
 
+    private static string CurrentExe =>
+        Environment.ProcessPath ?? Application.ExecutablePath;
+
+    private static string StartupTargetOf(string link)
+    {
+        var t = Type.GetTypeFromProgID("WScript.Shell");
+        if (t == null) return string.Empty;
+        dynamic shell = Activator.CreateInstance(t)!;
+        dynamic sc = shell.CreateShortcut(link);
+        return (string)(sc.TargetPath ?? string.Empty);
+    }
+
+    /// <summary>只判「文件存在」不够：exe 换目录后 .lnk 仍在但指向旧路径，开机自启会静默失效。</summary>
     private static bool IsStartupEnabled()
     {
-        try { return File.Exists(StartupLink); } catch { return false; }
+        try { return File.Exists(StartupLink); }
+        catch { return false; }
+    }
+
+    /// <summary>启动时校验快捷方式目标；不一致就重建，并提示一次。必须在 UI 线程写 COM。</summary>
+    private void EnsureStartupLinkTarget()
+    {
+        string link = StartupLink;
+        if (!File.Exists(link)) return;
+        string target;
+        try { target = StartupTargetOf(link); }
+        catch (Exception ex) { Logger.Error("startup link read: " + ex.Message); return; }
+        if (string.IsNullOrWhiteSpace(target)) return;   // 读不到就别乱动用户的快捷方式
+
+        string exe = CurrentExe;
+        bool same = string.Equals(Path.GetFullPath(target), Path.GetFullPath(exe),
+            StringComparison.OrdinalIgnoreCase);
+        if (same) return;
+
+        Logger.Info("startup link points to old exe, repairing: " + target);
+        Post(() =>
+        {
+            SetStartup(true);
+            _tray.ShowBalloonTip(6000, "SeerHover",
+                "检测到程序位置变化，已自动修复开机自启快捷方式。", ToolTipIcon.Info);
+        });
     }
 
     private void SetStartup(bool on)
@@ -351,7 +434,7 @@ internal sealed class TrayHost : ApplicationContext
                 return;
             }
 
-            string exe = Environment.ProcessPath ?? System.Windows.Forms.Application.ExecutablePath;
+            string exe = CurrentExe;
             var t = Type.GetTypeFromProgID("WScript.Shell");
             if (t == null)
             {
@@ -364,7 +447,7 @@ internal sealed class TrayHost : ApplicationContext
             sc.WorkingDirectory = Path.GetDirectoryName(exe);
             sc.WindowStyle = 7;
             sc.Save();
-            Logger.Info("startup enabled");
+            Logger.Info("startup enabled: " + exe);
         }
         catch (Exception ex)
         {
