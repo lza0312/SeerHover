@@ -106,20 +106,29 @@ internal sealed class HoverController : IDisposable
 
         if (!Native.GetCursorPos(out var cur)) return;
         bool moved = !_hasCursor || cur != _cursor;
+        var prevCursor = _cursor;
         _cursor = cur;
         _hasCursor = true;
         _tick++;
         long now = Environment.TickCount64;
 
-        // 点击/拖拽：立即收窗，并抑制当前项（本次停留在该项上不再弹）
+        // 点击：预览窗上的点击（媒体控件、缩放等）交给 Seer 处理，不收窗；
+        // 其它位置的点击按 HideOnClick 立即收窗并抑制当前项
         if (_cfg.HideOnClick && Native.IsKeyDown(Native.VK_LBUTTON))
         {
-            if (_activePath != null)
+            IntPtr clickRoot = Native.RootAt(cur, out _);
+            // 媒体控制条/弹出面板（NOACTIVATE）不属于 Seer 进程，但在上面点击是调音量/倍速，不能收窗
+            bool clickOnSeer = (clickRoot != IntPtr.Zero && Native.IsProcess(clickRoot, "seer"))
+                               || MediaOverlayForm.OwnsCursor(cur.X, cur.Y);
+            if (!clickOnSeer)
             {
-                _suppressedPath = _activePath;
-                DoHide(clearSuppress: false);
+                if (_activePath != null)
+                {
+                    _suppressedPath = _activePath;
+                    DoHide(clearSuppress: false);
+                }
+                ClearCandidate();
             }
-            ClearCandidate();
             return;
         }
 
@@ -171,6 +180,14 @@ internal sealed class HoverController : IDisposable
             }
         }
 
+        // 媒体控制条 / 音量 / 倍速弹出面板上：同属「操作预览」，不能计时收窗
+        // （面板是 NOACTIVATE 的独立窗口，不命中上面的 Seer 进程判定，否则一碰就关预览）
+        if (MediaOverlayForm.OwnsCursor(cur.X, cur.Y))
+        {
+            _offSince = 0;
+            return;
+        }
+
         // 只有光标移动时才重新识别，静止时只做 dwell / 宽限判定
         if (moved)
         {
@@ -192,7 +209,7 @@ internal sealed class HoverController : IDisposable
                     if (_suppressedPath != null && _suppressedPath != hit.Path) _suppressedPath = null;
                     if (Logger.IsVerbose) Logger.Info($"candidate: {hit}");
                     // 「原比例最大化」需要源文件像素尺寸，趁 dwell 阶段先探好，触发时直接命中缓存
-                    if (string.Equals(_cfg.Geometry.SizeMode, "auto", StringComparison.OrdinalIgnoreCase))
+                    if (GeometryController.EffectiveSizeMode(_cfg.Geometry, hit.Path) == "auto")
                         MediaSize.Prefetch(hit.Path);
                 }
                 else
@@ -203,8 +220,42 @@ internal sealed class HoverController : IDisposable
             }
         }
 
-        // 离开文件项后的宽限收窗
-        if (_activePath != null && _candidatePath == null && _offSince != 0 &&
+        // ── 收窗宽限的方向感知 ────────────────────────────────────────
+        // 光标已离开文件项但预览还开着：朝预览窗方向移动 = 想去操作媒体控件，不计时；
+        // 朝相反方向移动 / 移出预览窗 = 不需要了，宽限 HideGraceMs 后收窗。
+        if (_activePath != null && _candidatePath == null && moved && _offSince == 0)
+        {
+            var pr = _ipc.GetRect();
+            if (!pr.IsEmpty)
+            {
+                double vx = cur.X - prevCursor.X, vy = cur.Y - prevCursor.Y;
+                double px = (pr.Left + pr.Right) / 2.0 - cur.X;
+                double py = (pr.Top + pr.Bottom) / 2.0 - cur.Y;
+                if (vx * px + vy * py > 0) _offSince = -1;   // -1 = 朝预览窗移动中，暂不开始计时
+                else _offSince = now;
+            }
+            else if (_offSince == 0) _offSince = now;
+        }
+        // 之前是「朝预览窗移动」，这一拍停住或改朝反方向 → 恢复正常计时
+        if (_activePath != null && _candidatePath == null && _offSince < 0)
+        {
+            if (!moved)
+            {
+                // 停在半路：给个宽限起点，别无限期挂着
+                _offSince = now - Math.Max(0, _cfg.HideGraceMs - 100);
+            }
+            else
+            {
+                var pr2 = _ipc.GetRect();
+                double vx2 = cur.X - prevCursor.X, vy2 = cur.Y - prevCursor.Y;
+                double px2 = pr2.IsEmpty ? 0 : (pr2.Left + pr2.Right) / 2.0 - cur.X;
+                double py2 = pr2.IsEmpty ? 0 : (pr2.Top + pr2.Bottom) / 2.0 - cur.Y;
+                if (pr2.IsEmpty || vx2 * px2 + vy2 * py2 <= 0) _offSince = now;
+            }
+        }
+
+        // 离开文件项后的宽限收窗（_offSince 为 -1 表示正朝预览窗移动，不计时）
+        if (_activePath != null && _candidatePath == null && _offSince > 0 &&
             now - _offSince >= _cfg.HideGraceMs)
         {
             if (Logger.IsVerbose) Logger.Info("hide: cursor left item");
@@ -223,37 +274,62 @@ internal sealed class HoverController : IDisposable
 
     private void DoInvoke(HoverTarget target, Native.POINT cursor)
     {
-        // V2 优先：rect 必须和路径一起发给 Seer，才能禁掉它的 content-fit 自动缩放
-        // （否则图片会先铺成原始尺寸再被我们缩回，肉眼可见跳动）。
-        // 算 rect 需要先探源尺寸，可能几十毫秒，放在 timer 线程里不影响 UI。
+        Native.RECT? planRect = null;
         bool openedViaV2 = false;
+        string previewPath = target.Path;
+
         if (_v2 != null && _v2.IsAvailable)
         {
-            var rect = _geometry.Plan(target, cursor);
-            if (rect.HasValue && !rect.Value.IsEmpty)
-                openedViaV2 = _v2.PreviewOpen(target.Path, rect.Value);
+            planRect = _geometry.Plan(target, cursor);
+            if (planRect.HasValue && !planRect.Value.IsEmpty)
+            {
+                // 预览窗显示前先摆到位：Seer 应用 rect 是异步的，不预摆会先露一帧小窗
+                _geometry.PrePosition(planRect.Value);
+
+                // 放大显示：Seer 带 rect 不放大图片，只能把小图先重采样成临时大图。
+                if (_cfg.Geometry.UpscaleToFill)
+                {
+                    var up = PreviewUpscaler.Get(target.Path, planRect.Value.Width, planRect.Value.Height);
+                    if (up != null) previewPath = up;
+                }
+                openedViaV2 = _v2.PreviewOpen(previewPath, planRect.Value);
+                if (openedViaV2) _geometry.Watch(planRect.Value);   // 打开后短盯一会，防 Seer 回跳尺寸
+            }
         }
 
         if (!openedViaV2)
         {
-            // 回退：老版 Seer / V2 不可用时，仍走 5000 + SetWindowPos 纠偏
-            _ipc.Invoke(target.Path);
-            _geometry.Apply(target, cursor);
+            // V2 不可用 / 失败（如 -32001 NOT_ACTIVE）→ legacy 5000 回退。
+            // 实测 Seer 显示瞬间会用它自己的尺寸覆盖预摆位，所以关键是
+            // 「先起盯梢再开窗」：Watch 等窗口一可见就 MoveTo，闪变压到一帧以内。
+            planRect ??= _geometry.Plan(target, cursor);
+            if (planRect.HasValue && !planRect.Value.IsEmpty)
+            {
+                _geometry.PrePosition(planRect.Value);
+                _geometry.Watch(planRect.Value);
+                _ipc.Invoke(target.Path);
+            }
+            else
+            {
+                // seer 尺寸模式：只触发，几何交给 Seer
+                _ipc.Invoke(target.Path);
+                _geometry.Apply(target, cursor);
+            }
         }
 
         _lastInvoke = Environment.TickCount64;
         _activePath = target.Path;
         _offSince = 0;
-        if (Logger.IsVerbose) Logger.Info($"invoke: {target.Path} (dwell {_cfg.DwellMs}ms, v2={openedViaV2})");
+        if (Logger.IsVerbose) Logger.Info($"invoke: {target.Path} (dwell {_cfg.DwellMs}ms, v2={openedViaV2}, upscaled={previewPath != target.Path})");
         Raise(target.Path);
-        VerifyLater(target.Path);
+        VerifyLater(target.Path, previewPath);
     }
 
     /// <summary>
     /// Seer 若开着「跟随资源管理器选中项」，会在预览出现后把画面切回选中项。
     /// 这里回查一次，确认显示的确是悬停文件；不一致就收窗并上报，避免一直显示错文件。
     /// </summary>
-    private void VerifyLater(string path)
+    private void VerifyLater(string path, string? previewPath = null)
     {
         if (!_cfg.VerifyPreview) return;
 
@@ -275,7 +351,9 @@ internal sealed class HoverController : IDisposable
                 if (_activePath != path) return;      // 已经切到别的文件/收窗
                 string cur = _ipc.GetCurrentFile();
                 if (string.IsNullOrEmpty(cur)) return; // 查询不可用，不做判断
-                if (Matches(cur, path)) return;
+                // 预览的是放大副本时，Seer 回报的也是副本路径；但「跟随选中项」也可能
+                // 把它切回原路径，两者都算命中，避免误判成显示错文件而收窗。
+                if (Matches(cur, previewPath ?? path) || Matches(cur, path)) return;
 
                 if (Logger.IsVerbose) Logger.Info($"preview mismatch: want '{path}' got '{cur}'");
                 PreviewMismatch?.Invoke(path);

@@ -78,7 +78,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
         KeyPreview = true;
-        Icon = SystemIcons.Application;
+        Icon = Program.AppIcon(64);
 
         AutoScaleMode = AutoScaleMode.None;
         ApplyWindowSize();
@@ -198,11 +198,14 @@ internal sealed class SettingsForm : Form, IMessageFilter
             Padding = new Padding(S(20), S(14), S(20), S(10))
         };
 
+        // 左侧栏调窄：宽度 = 顶部 "SeerHover" 标题宽度 + 少量边距；版本号挪到「悬停预览」下面
+        int railW = Math.Max(S(110), TextRenderer.MeasureText("SeerHover", Theme.H1).Width + S(36));
         _rail = new NavRail
         {
             Dock = DockStyle.Left,
-            Width = S(184),
-            SubHeader = "悬停预览 · v" + (typeof(SettingsForm).Assembly.GetName().Version?.ToString(3) ?? "1.0.0")
+            Width = railW,
+            SubHeader = "悬停预览",
+            SubHeader2 = "v" + (typeof(SettingsForm).Assembly.GetName().Version?.ToString(3) ?? "1.0.0")
         };
         _rail.Items.AddRange(new[] { "常规", "窗口", "过滤", "高级" });
         _rail.SelectedIndexChanged += (_, _) => ShowPage(_rail.SelectedIndex);
@@ -268,6 +271,26 @@ internal sealed class SettingsForm : Form, IMessageFilter
             _content.Controls.Add(p);
         }
         ShowPage(_rail.SelectedIndex < 0 ? 0 : _rail.SelectedIndex);
+    }
+
+    /// <summary>诊断用：截图指定页。--settings-shot 通过它逐页检查文字。</summary>
+    public void SelectPageForDiagnostic(int index)
+    {
+        if (index < 0 || index >= _pages.Count) return;
+        _rail.SelectedIndex = index;
+        ShowPage(index);
+        if (Environment.GetEnvironmentVariable("SEER_DEBUG_ROWS") == "1") DumpRows(index);
+    }
+
+    /// <summary>诊断：打印某页全部行的子控件布局（SEER_DEBUG_ROWS=1）。</summary>
+    public void DumpRows(int index)
+    {
+        void Dump(Control c, string indent)
+        {
+            Console.WriteLine($"{indent}{c.GetType().Name} bounds={c.Bounds} visible={c.Visible}");
+            foreach (Control k in c.Controls) Dump(k, indent + "  ");
+        }
+        Dump(_pages[index], "");
     }
 
     private void ShowPage(int index)
@@ -395,20 +418,31 @@ internal sealed class SettingsForm : Form, IMessageFilter
         stack.Card(
             ToggleRow("启用悬停预览", "总开关，关掉后等同于暂停。", _work.Enabled, v => _work.Enabled = v),
             ToggleRow("文件夹也预览", "默认只对文件生效；开启后悬停文件夹同样弹出预览。", _work.PreviewFolders, v => _work.PreviewFolders = v),
-            ToggleRow("开机自启", "登录 Windows 后在托盘里自动运行。", _host.IsStartupEnabled(), v => _host.SetStartup(v)));
+            ToggleRow("开机自启", "登录 Windows 后在托盘里自动运行。", _host.IsStartupEnabled(), v => _host.SetStartup(v)),
+            ToggleRow("双击空白处回到上一层",
+                "在资源管理器文件列表的空白处双击，等同于按 Alt+↑ 返回上一层文件夹；双击文件/文件夹本身不受影响。",
+                _work.DoubleClickUp, v => _work.DoubleClickUp = v));
 
         stack.Gap(16);
         stack.Section("外观");
         stack.Card(
             ToggleRow("深色模式", "设置窗口与托盘菜单的配色；首次打开时跟随系统，切换后会记住选择。",
                 Theme.IsDark, SetDarkMode),
-            SliderRow("界面缩放", "设置窗口和托盘图标右键菜单的整体大小（字号、间距一起缩放）。拖动后立即预览，点「应用 / 确认」长期生效。",
+            SliderRow("界面缩放", "整体缩放设置窗和托盘菜单。",
                 80, 160, 5, _work.UiScale, "%", SetUiScale));
+
+        stack.Gap(16);
+        stack.Section("媒体控件");
+        stack.Card(
+            SliderRow("默认音量", "悬停预览音/视频时控件条的初始音量（只改 Seer 自己的会话音量，不影响系统）。", 0, 100, 5,
+                _work.MediaVolume, "%", v => _work.MediaVolume = v),
+            SliderRow("默认倍速", "100% = 1.00 倍速；范围 20%–600%（0.20–6.00 倍），按 20% 步进。", 20, 600, 20,
+                (int)Math.Round(_work.MediaRate * 100), "%", v => _work.MediaRate = Math.Round(v / 20.0) * 0.2));
 
         stack.Gap(16);
         stack.Section("时机");
         stack.Card(
-            SliderRow("悬停触发延迟", "光标停在同一个文件上多久后弹出预览。调小更跟手，调大更不容易误触。",
+            SliderRow("悬停触发延迟", "停在文件上多久后弹出预览。",
                 100, 1500, 10, _work.DwellMs, "ms", v => _work.DwellMs = v),
             SliderRow("离开后收起延迟", "光标离开文件后多久收回预览窗。", 0, 800, 10, _work.HideGraceMs, "ms", v => _work.HideGraceMs = v));
 
@@ -417,13 +451,6 @@ internal sealed class SettingsForm : Form, IMessageFilter
         stack.Card(
             ToggleRow("按住 Ctrl / Shift / Alt 时不触发", "避免和框选、多选、拖拽操作冲突。", _work.SuppressOnModifiers, v => _work.SuppressOnModifiers = v),
             ToggleRow("点击文件时收起预览", "点一下就收窗，不用等光标移开。", _work.HideOnClick, v => _work.HideOnClick = v));
-
-        stack.Gap(16);
-        stack.Section("鼠标");
-        stack.Card(
-            ToggleRow("双击空白处回到上一层",
-                "在资源管理器文件列表的空白处双击，等同于按 Alt+↑ 返回上一层文件夹；双击文件/文件夹本身不受影响。",
-                _work.DoubleClickUp, v => _work.DoubleClickUp = v));
 
         stack.Finish();
         return page;
@@ -434,36 +461,302 @@ internal sealed class SettingsForm : Form, IMessageFilter
         var (page, stack) = NewPage();
 
         // 当前屏幕（物理像素）：写进说明里，方便直接填「铺满整屏」的数值
-        var mon = Native.MonitorOf(Cursor.Position.X, Cursor.Position.Y).rcMonitor;
-        string scrText = mon.IsEmpty ? "未知" : $"{mon.Width}×{mon.Height}";
 
         stack.Section("位置");
+
+        // 条件显示：弹出位置选「屏幕角落」才显示角落/边距，选「固定坐标」才显示 X/Y，
+        // 选「光标旁」时这两组不生效的设定项直接隐藏，页面更短。
+        SettingRow cornerRow = null!, marginRow = null!, xRow = null!, yRow = null!;
+        void UpdatePlaceRows(int modeIndex)
+        {
+            // 只写 RowVisible：页面隐藏期间 WinForms 的 Visible 不可靠，Reflow 会用 RowVisible 同步 Visible。
+            cornerRow.RowVisible = marginRow.RowVisible = modeIndex == 1;   // 屏幕角落
+            xRow.RowVisible = yRow.RowVisible = modeIndex == 2;             // 固定坐标
+            stack.Reflow();
+        }
+
         stack.Card(
-            SegRow("弹出位置", "预览窗口出现在哪里。「光标旁」会自动挑空间更大的方向。",
-                new[] { "光标旁", "屏幕角落", "固定坐标" }, ModeIndex(_work.Geometry.Mode), i => _work.Geometry.Mode = ModeValue(i)),
+            SegRow("弹出位置", "「光标旁」会挑空间更大的方向。",
+                new[] { "光标旁", "屏幕角落", "固定坐标" }, ModeIndex(_work.Geometry.Mode),
+                i => _work.Geometry.Mode = ModeValue(i), UpdatePlaceRows),
             ToggleRow("不遮挡鼠标", "自动避开鼠标和文件图标所在的位置；空间不够时仍会贴边。",
                 _work.Geometry.AvoidCursor, v => _work.Geometry.AvoidCursor = v),
-            SliderRow("与文件的间距", "窗口和文件图标之间留的空隙。", 0, 80, 2, _work.Geometry.Gap, "px", v => _work.Geometry.Gap = v),
-            SegRow("角落", "仅「屏幕角落」模式生效。", new[] { "左上", "右上", "左下", "右下" },
+            SliderRow("与光标的间距", "窗口边缘到鼠标的最小距离。", 0, 80, 2, _work.Geometry.Gap, "px", v => _work.Geometry.Gap = v),
+            cornerRow = SegRow("角落", "仅「屏幕角落」模式生效。", new[] { "左上", "右上", "左下", "右下" },
                 CornerIndex(_work.Geometry.Corner), i => _work.Geometry.Corner = CornerValue(i)),
-            SliderRow("屏幕边距", "窗口到屏幕边缘的距离。", 0, 120, 4, _work.Geometry.Margin, "px", v => _work.Geometry.Margin = v),
-            SliderRow("固定坐标 X", "仅「固定坐标」模式生效；多显示器左侧可以是负数。", -7680, 7680, 10, _work.Geometry.X, "px", v => _work.Geometry.X = v),
-            SliderRow("固定坐标 Y", "仅「固定坐标」模式生效；多显示器上方可以是负数。", -4320, 4320, 10, _work.Geometry.Y, "px", v => _work.Geometry.Y = v));
+            marginRow = SliderRow("屏幕边距", "窗口到屏幕边缘的距离。", 0, 120, 4, _work.Geometry.Margin, "px", v => _work.Geometry.Margin = v),
+            xRow = SliderRow("固定坐标 X", "仅固定坐标模式生效，可为负数。", -7680, 7680, 10, _work.Geometry.X, "px", v => _work.Geometry.X = v),
+            yRow = SliderRow("固定坐标 Y", "仅固定坐标模式生效，可为负数。", -4320, 4320, 10, _work.Geometry.Y, "px", v => _work.Geometry.Y = v));
+
+        UpdatePlaceRows(ModeIndex(_work.Geometry.Mode));
 
         stack.Gap(16);
         stack.Section("尺寸");
-        stack.Card(
-            SegRow("尺寸策略", "「原比例最大化」按图片/视频的原始比例显示：放得下就用原尺寸，放不下按屏幕缩小。",
-                new[] { "固定尺寸", "原比例最大化", "跟随 Seer" }, SizeModeIndex(_work.Geometry.SizeMode), i => _work.Geometry.SizeMode = SizeModeValue(i)),
-            SliderRow("宽度", $"仅「固定尺寸」使用。可直接输入精确像素（上限 7680，兼容 8K / 带鱼屏）。当前屏幕 {scrText}。",
-                765, 7680, 5, Math.Max(765, _work.Geometry.Width), "px", v => _work.Geometry.Width = v),
-            SliderRow("高度", $"仅「固定尺寸」使用。可直接输入（上限 4320）。想铺满屏幕高度就填 {(mon.IsEmpty ? 2160 : mon.Height)}。",
-                645, 4320, 5, Math.Max(645, _work.Geometry.Height), "px", v => _work.Geometry.Height = v),
-            SliderRow("最大占屏比", "「原比例最大化」时窗口最多占屏幕的比例；固定尺寸不受它限制。",
-                30, 100, 5, (int)Math.Round(_work.Geometry.MaxScreenRatio * 100), "%", v => _work.Geometry.MaxScreenRatio = v / 100.0));
+        stack.Note("每类文件单独选尺寸策略；选「固定」出现宽 / 高滑杆，选「比例最大化」出现放大填满与占屏比。");
+
+        // 一张卡装下全部：分类之间细线分隔（同位置卡内样式），分类与它的参数行之间无分隔。
+        var fixedRows = new Dictionary<string, SettingRow>();
+        var ratioRows = new Dictionary<string, SettingRow>();
+        var catRows = new List<SettingRow>();
+        foreach (var kind in MediaKind.Categories)
+        {
+            catRows.Add(CategoryRow(kind, KindFormats(kind),
+                CurrentCategoryIndex(kind),
+                i => SetCategoryMode(kind, i),
+                _ => UpdateCategoryRows()));
+            var ratioRow = RatioParamsRow();
+            ratioRow.GroupWithPrev = true;    // 参数行跟它的分类行同组
+            ratioRows[kind] = ratioRow;
+            catRows.Add(ratioRow);
+            var fixedRow = CategoryFixedRow(kind);
+            fixedRow.GroupWithPrev = true;
+            catRows.Add(fixedRows[kind] = fixedRow);
+        }
+        stack.Card(catRows.ToArray());
+        UpdateCategoryRows();
+
+        void UpdateCategoryRows()
+        {
+            // 与 CurrentCategoryIndex 同一套有效模式判断：未显式设置键的分类沿用全局尺寸策略
+            string Effective(string kind) =>
+                CurrentCategoryMode(kind) ?? (_work.Geometry.SizeMode ?? "fixed").Trim().ToLowerInvariant();
+
+            foreach (var (kind, row) in fixedRows)
+                row.RowVisible = Effective(kind) == "fixed";
+            foreach (var (kind, row) in ratioRows)
+                row.RowVisible = Effective(kind) == "auto";
+            stack.Reflow();
+        }
 
         stack.Finish();
         return page;
+    }
+
+    private static string KindFormats(string kind) => kind switch
+    {
+        MediaKind.Image => "jpg · png · gif · webp · heic · psd · svg · raw",
+        MediaKind.Video => "mp4 · mkv · mov · avi · wmv · webm · flv",
+        MediaKind.Audio => "mp3 · wav · flac · aac · ogg · m4a · ape",
+        MediaKind.Web => "html · mhtml · url 链接",
+        MediaKind.Text => "txt · md · json · xml · 代码与字幕",
+        MediaKind.Archive => "zip · rar · 7z · tar · iso",
+        MediaKind.Document => "pdf · office · epub · djvu",
+        MediaKind.Folder => "目录（开启「文件夹也预览」后生效）",
+        _ => "未登记的扩展名一律归到这里"
+    };
+
+    /// <summary>
+    /// 分类选「比例最大化」时显示的参数行（跟随分类行，GroupWithPrev）：
+    /// 左窄 = 放大填满窗口（开关），右宽 = 最大占屏比（滑杆 + 输入框）。
+    /// 两个值是全局配置（Geometry.UpscaleToFill / MaxScreenRatio），多个分类行显示的是同一组值，
+    /// 重排时把控件显示同步到全局，改任意一行其它行跟着变。
+    /// </summary>
+    private SettingRow RatioParamsRow()
+    {
+        var t = TitleLabel("放大填满窗口");
+        var d = DescLabel("小尺寸文件生成临时放大副本，Seer 才会把窗口填满。");
+        var sw = new ToggleSwitch { Checked = _work.Geometry.UpscaleToFill };
+        var nf = new NumberField(Math.Clamp((int)Math.Round(_work.Geometry.MaxScreenRatio * 100), 30, 100), 30, 100, 5, "%");
+        var sl = new SliderControl { Minimum = 30, Maximum = 100, Step = 5, Value = nf.Value };
+
+        void ApplyGlobal()
+        {
+            _work.Geometry.UpscaleToFill = sw.Checked;
+            _work.Geometry.MaxScreenRatio = sl.Value / 100.0;
+        }
+
+        bool sync = false;
+        sl.ValueChanged += (_, _) => { if (sync) return; sync = true; nf.SetValueFromCode(sl.Value); sync = false; ApplyGlobal(); };
+        nf.ValueChanged += (_, _) => { if (sync) return; sync = true; sl.Value = nf.Value; nf.SetValueFromCode(sl.Value); sync = false; ApplyGlobal(); };
+        sw.CheckedChanged += (_, _) => ApplyGlobal();
+
+        var row = new SettingRow((r, w) =>
+        {
+            // 多个分类都选「比例最大化」时会有多行参数行：每次重排把显示值对齐全局
+            sync = true;
+            sw.Checked = _work.Geometry.UpscaleToFill;
+            sl.Value = Math.Clamp((int)Math.Round(_work.Geometry.MaxScreenRatio * 100), 30, 100);
+            nf.SetValueFromCode(sl.Value);
+            sync = false;
+
+            int swW = S(46), swH = S(26);
+            int fieldW = Math.Clamp(S(96), S(84), S(132)), fieldH = S(28);
+
+            // 左：标题 + 开关（窄），右：滑杆 + 输入框（宽）
+            int leftW = S(150);
+            int titleH = S(28);
+            int descH = Math.Min(d.MeasureHeight(leftW), S(56));   // 最多两行，多余裁掉
+            int blockH = titleH + (descH > 0 ? S(4) + descH : 0);
+            int h = Math.Max(S(64), blockH + S(14));
+            r.Height = h;
+
+            int ty = Math.Max(S(6), (h - blockH) / 2);
+            t.Bounds = new Rectangle(0, ty, leftW, titleH);
+            d.Visible = descH > 0;
+            if (descH > 0) d.Bounds = new Rectangle(0, ty + titleH + S(2), leftW, descH);
+            sw.Size = new Size(swW, swH);
+            sw.Location = new Point(leftW + S(8), (h - swH) / 2);
+
+            int rightW = w - leftW - swW - S(36);
+            int sx = w - rightW;
+            int sy = (h - fieldH) / 2;
+            sl.SetBounds(sx, sy + (fieldH - S(26)) / 2, Math.Min(S(230), rightW - fieldW - S(10)), S(26));
+            nf.SetBounds(sx + Math.Min(S(230), rightW - fieldW - S(10)) + S(10), sy, fieldW, fieldH);
+        });
+
+        row.Controls.Add(t);
+        row.Controls.Add(d);
+        row.Controls.Add(sw);
+        row.Controls.Add(sl);
+        row.Controls.Add(nf);
+        return row;
+    }
+
+    /// <summary>
+    /// 分类策略行：说明是对应分类的支持格式；说明一行放不下就整段隐藏（不折行、不覆盖右侧选择框）。
+    /// </summary>
+    private SettingRow CategoryRow(string kind, string formats, int index, Action<int> set, Action<int> afterChange)
+    {
+        var t = TitleLabel(MediaKind.Label(kind));
+        var d = DescLabel(formats);
+        var seg = new Segmented { Options = CategoryOptions, SelectedIndex = Math.Clamp(index, 0, CategoryOptions.Length - 1) };
+        seg.SelectedIndexChanged += (_, _) =>
+        {
+            set(seg.SelectedIndex);
+            afterChange?.Invoke(seg.SelectedIndex);
+        };
+
+        var row = new SettingRow((r, w) =>
+        {
+            int segW = S(232);   // 三个短标签足够，右侧选择框做窄
+            int labelW = w - segW - S(18);
+            // 用 MeasureHeight（与实际折行渲染同一套测量）判断：折两行以内显示，更多 = 超出显示范围整段隐藏。
+            // TextRenderer.MeasureText 对混排中文会用保守度量误判超宽，不能用来判。
+            int descH = string.IsNullOrEmpty(d.Text) ? 0 : d.MeasureHeight(labelW);
+            d.Visible = descH > 0 && descH <= S(56);
+            if (!d.Visible) descH = 0;
+
+            int titleH = S(28);
+            int blockH = titleH + (descH > 0 ? S(4) + descH : 0);
+            int h = Math.Max(S(62), blockH + S(16));
+            r.Height = h;
+            int y = Math.Max(S(6), (h - blockH) / 2);
+            t.Bounds = new Rectangle(0, y, labelW, titleH);
+            if (descH > 0) d.Bounds = new Rectangle(0, y + titleH + S(2), labelW, descH);
+            seg.SetBounds(w - segW, (h - S(34)) / 2, segW, S(34));
+        });
+
+        row.Controls.Add(t);
+        row.Controls.Add(d);
+        row.Controls.Add(seg);
+        return row;
+    }
+
+    private static readonly string[] CategoryOptions = { "固定", "比例最大化", "Seer" };
+
+    private string? CurrentCategoryMode(string kind) =>
+        _work.Geometry.CategoryModes != null && _work.Geometry.CategoryModes.TryGetValue(kind, out var v) ? v : null;
+
+    private static int Mode3(string? mode) => mode switch
+    {
+        "fixed" => 0,
+        "auto" => 1,
+        "seer" => 2,
+        _ => -1
+    };
+
+    /// <summary>类别未设置时沿用全局「尺寸策略」的当前值显示（配置里没有 UI 可改全局了，仅作兜底展示）。</summary>
+    private int CurrentCategoryIndex(string kind)
+    {
+        int m = Mode3(CurrentCategoryMode(kind));
+        if (m >= 0) return m;
+        return Mode3((_work.Geometry.SizeMode ?? "fixed").Trim().ToLowerInvariant()) switch
+        {
+            1 => 1,
+            2 => 2,
+            _ => 0
+        };
+    }
+
+    private void SetCategoryMode(string kind, int index)
+    {
+        var dict = _work.Geometry.CategoryModes ??=
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        dict[kind] = index switch
+        {
+            1 => "auto",
+            2 => "seer",
+            _ => "fixed"
+        };
+        if (dict.Count == 0) _work.Geometry.CategoryModes = null;
+    }
+
+    private (int W, int H) CurrentCategorySize(string kind)
+    {
+        if (_work.Geometry.CategorySizes != null &&
+            _work.Geometry.CategorySizes.TryGetValue(kind, out var s) && s is { Length: 2 } && s[0] > 0 && s[1] > 0)
+            return (s[0], s[1]);
+        return (_work.Geometry.Width, _work.Geometry.Height);
+    }
+
+    private void SaveCategorySize(string kind, int w, int h)
+    {
+        var dict = _work.Geometry.CategorySizes ??= new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+        dict[kind] = new[] { w, h };
+    }
+
+    /// <summary>
+    /// 类别「固定」尺寸行：宽 [滑杆][输入] 高 [滑杆][输入]，只在所属类别选「固定」时显示。
+    /// 下限放宽到 320x240（Seer 若坚持自己的最小窗会自动夹回，盯梢逻辑会采纳实际值）。
+    /// </summary>
+    private SettingRow CategoryFixedRow(string kind)
+    {
+        const int minW = 320, minH = 240, maxW = 7680, maxH = 4320;
+        var (w0, h0) = CurrentCategorySize(kind);
+        var tW = new WrapLabel { Text = "宽", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
+        var tH = new WrapLabel { Text = "高", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
+        var sW = new SliderControl { Minimum = minW, Maximum = maxW, Step = 5, Value = Math.Clamp(w0, minW, maxW) };
+        var sH = new SliderControl { Minimum = minH, Maximum = maxH, Step = 5, Value = Math.Clamp(h0, minH, maxH) };
+        var nW = new NumberField(sW.Value, minW, maxW, 5, "px");
+        var nH = new NumberField(sH.Value, minH, maxH, 5, "px");
+
+        bool sync = false;
+        void Save() => SaveCategorySize(kind, nW.Value, nH.Value);
+        nW.ValueChanged += (_, _) => { if (sync) return; sync = true; sW.Value = nW.Value; nW.SetValueFromCode(sW.Value); sync = false; Save(); };
+        sW.ValueChanged += (_, _) => { if (sync) return; sync = true; nW.SetValueFromCode(sW.Value); sync = false; Save(); };
+        nH.ValueChanged += (_, _) => { if (sync) return; sync = true; sH.Value = nH.Value; nH.SetValueFromCode(sH.Value); sync = false; Save(); };
+        sH.ValueChanged += (_, _) => { if (sync) return; sync = true; nH.SetValueFromCode(sH.Value); sync = false; Save(); };
+
+        var row = new SettingRow((r, w) =>
+        {
+            int fieldW = Math.Clamp(S(104), S(84), S(132));
+            int fieldH = S(28);
+            int lblW = S(28);
+            int sliderW = Math.Max(S(120), (w - 2 * (lblW + fieldW) - S(72)) / 2);
+
+            int h = Math.Max(S(58), fieldH + S(24));
+            r.Height = h;
+            int y = (h - fieldH) / 2;
+            int sy = (h - S(26)) / 2;
+
+            int x = S(10);
+            tW.Bounds = new Rectangle(x, y, lblW, fieldH);
+            sW.SetBounds(x + lblW + S(6), sy, sliderW, S(26));
+            nW.SetBounds(x + lblW + S(6) + sliderW + S(8), y, fieldW, fieldH);
+
+            int x2 = x + lblW + S(6) + sliderW + S(8) + fieldW + S(30);
+            tH.Bounds = new Rectangle(x2, y, lblW, fieldH);
+            sH.SetBounds(x2 + lblW + S(6), sy, sliderW, S(26));
+            nH.SetBounds(x2 + lblW + S(6) + sliderW + S(8), y, fieldW, fieldH);
+        });
+
+        row.Controls.Add(tW);
+        row.Controls.Add(sW);
+        row.Controls.Add(nW);
+        row.Controls.Add(tH);
+        row.Controls.Add(sH);
+        row.Controls.Add(nH);
+        return row;
     }
 
     private ScrollHost BuildFilterPage()
@@ -496,7 +789,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         stack.Card(
             ToggleRow("回查预览的是否同一个文件", "Seer 若开着「跟随选中项」会把画面切走，开启回查会自动收窗。",
                 _work.VerifyPreview, v => _work.VerifyPreview = v),
-            SliderRow("回查延迟", "要大于 Seer 内部刷新间隔，太短容易误判。", 300, 1500, 50, _work.VerifyDelayMs, "ms", v => _work.VerifyDelayMs = v));
+            SliderRow("回查延迟", "太短容易误判。", 300, 1500, 50, _work.VerifyDelayMs, "ms", v => _work.VerifyDelayMs = v));
 
         stack.Gap(16);
         stack.Section("性能与日志");
@@ -521,15 +814,12 @@ internal sealed class SettingsForm : Form, IMessageFilter
 
     // ── 行构件 ──────────────────────────────────────────────────────
 
-    private static Label TitleLabel(string title) => new()
+    private static WrapLabel TitleLabel(string title) => new()
     {
         Text = title,
-        AutoSize = false,
         Font = Theme.BodyStrong,
         ForeColor = Theme.Text,
-        BackColor = Color.Transparent,
-        TextAlign = ContentAlignment.MiddleLeft,
-        UseMnemonic = false
+        BackColor = Color.Transparent
     };
 
     private static WrapLabel DescLabel(string desc) => new()
@@ -542,16 +832,19 @@ internal sealed class SettingsForm : Form, IMessageFilter
     };
 
     /// <summary>摆放标题 / 说明（说明按实际换行行数撑高），并设置行高。返回（说明块高度, 块起始 y）。</summary>
-    private (int BlockH, int Y) LayoutText(SettingRow row, Label t, WrapLabel d, int labelW, int minRowH, bool top)
+    private (int BlockH, int Y) LayoutText(SettingRow row, WrapLabel t, WrapLabel d, int labelW, int minRowH, bool top)
     {
-        int titleH = S(22);
+        // 标题留 28 逻辑像素（原 22 在 150% DPI + 界面缩放下会把粗体汉字上半截裁掉）
+        int titleH = S(28);
         int w = Math.Max(S(60), labelW);
-        int descH = d.Visible ? d.MeasureHeight(w) : 0;
-        int blockH = titleH + (descH > 0 ? S(2) + descH : 0);
-        int h = Math.Max(minRowH, blockH + S(12));
+        // 不能看 d.Visible：父页隐藏时 WinForms 的 Visible 也返回 false，
+        // 会把说明当成不存在、标题重新居中下移，说明留在旧位置被盖掉上半截。
+        int descH = !string.IsNullOrEmpty(d.Text) ? d.MeasureHeight(w) : 0;
+        int blockH = titleH + (descH > 0 ? S(4) + descH : 0);
+        int h = Math.Max(minRowH, blockH + S(16));
         row.Height = h;
 
-        int y = top ? S(4) : Math.Max(S(2), (h - blockH) / 2);
+        int y = top ? S(6) : Math.Max(S(6), (h - blockH) / 2);
         t.Bounds = new Rectangle(0, y, w, titleH);
         if (descH > 0) d.Bounds = new Rectangle(0, y + titleH + S(2), w, descH);
         return (blockH, y);
@@ -649,7 +942,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         return row;
     }
 
-    private SettingRow SegRow(string title, string desc, string[] options, int index, Action<int> set)
+    private SettingRow SegRow(string title, string desc, string[] options, int index, Action<int> set, Action<int>? afterChange = null)
     {
         var t = TitleLabel(title);
         var d = DescLabel(desc);
@@ -658,7 +951,11 @@ internal sealed class SettingsForm : Form, IMessageFilter
             Options = options,
             SelectedIndex = Math.Clamp(index, 0, options.Length - 1)
         };
-        seg.SelectedIndexChanged += (_, _) => set(seg.SelectedIndex);
+        seg.SelectedIndexChanged += (_, _) =>
+        {
+            set(seg.SelectedIndex);
+            afterChange?.Invoke(seg.SelectedIndex);
+        };
 
         var row = new SettingRow((r, w) =>
         {
@@ -671,7 +968,8 @@ internal sealed class SettingsForm : Form, IMessageFilter
             }
             else
             {
-                int segW = Math.Min(S(350), Math.Max(S(250), (int)(w * 0.48)));
+                // 分段区按选项文字量宽度，避免「原比例最大化」这类长标签被省略号截断
+                int segW = Math.Min(S(440), Math.Max(S(250), (int)(w * 0.5)));
                 LayoutText(r, t, d, w - segW - S(18), S(72), false);
                 seg.SetBounds(w - segW, (r.Height - S(34)) / 2, segW, S(34));
             }
@@ -761,15 +1059,6 @@ internal sealed class SettingsForm : Form, IMessageFilter
     };
 
     private static string ModeValue(int i) => i switch { 1 => "corner", 2 => "fixed", _ => "cursor" };
-
-    private static int SizeModeIndex(string mode) => mode switch
-    {
-        "auto" => 1,
-        "seer" => 2,
-        _ => 0
-    };
-
-    private static string SizeModeValue(int i) => i switch { 1 => "auto", 2 => "seer", _ => "fixed" };
 
     private static int CornerIndex(string corner) => corner switch
     {

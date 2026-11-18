@@ -27,6 +27,7 @@ internal sealed class ExplorerItemCache
     private IntPtr _hwnd;
     private Native.RECT _winRect;
     private string _title = string.Empty;
+    private Uia.TabInfo _tab;
     private long _refreshedAt;
     private long _titleCheckedAt;
     private volatile List<ExplorerItem> _items = new();
@@ -52,15 +53,25 @@ internal sealed class ExplorerItemCache
             windowMoved = !SameRect(wr, _winRect);
         }
 
-        // 标题变化 = 换了目录（项名字全变），每 400ms 抽查一次就够
+        // 标题变化 = 换了目录（项名字全变），每 400ms 抽查一次就够。
+        // 多标签页切换时顶层标题可能不变，所以同时抽查激活标签——变了也要重扫。
         bool titleDue = now - _titleCheckedAt >= TitleCheckMs;
         bool expired = now - _refreshedAt > TtlMs;
 
         if (windowMoved || titleDue || expired)
         {
-            string title = windowMoved || titleDue ? TitleOf(hwnd) : _title;
-            _titleCheckedAt = now;
-            if (windowMoved || expired || title != _title) Refresh(hwnd, title);
+            string title = _title;
+            var tab = _tab;
+            if (windowMoved || titleDue)
+            {
+                title = TitleOf(hwnd);
+                tab = Uia.ActiveTab(hwnd);
+                _titleCheckedAt = now;
+            }
+            bool tabChanged = tab != _tab;
+            bool titleChanged = title != _title;
+            if (windowMoved || expired || titleChanged || tabChanged)
+                Refresh(hwnd, title, tab);
         }
 
         var items = _items;
@@ -79,7 +90,7 @@ internal sealed class ExplorerItemCache
         // 未命中多半是滚动/刷新/切换了目录：限频重扫一次
         if (now - _refreshedAt > MinRefreshGapMs)
         {
-            Refresh(hwnd, TitleOf(hwnd));
+            Refresh(hwnd, TitleOf(hwnd), Uia.ActiveTab(hwnd));
             hit = Find(_items, point);
             if (hit != null)
             {
@@ -96,6 +107,7 @@ internal sealed class ExplorerItemCache
         {
             _hwnd = IntPtr.Zero;
             _title = string.Empty;
+            _tab = default;
             _refreshedAt = 0;
             _titleCheckedAt = 0;
             _items = new List<ExplorerItem>(0);
@@ -116,14 +128,14 @@ internal sealed class ExplorerItemCache
         return null;
     }
 
-    private void Refresh(IntPtr hwnd, string title)
+    private void Refresh(IntPtr hwnd, string title, Uia.TabInfo tab)
     {
         // 已有线程在扫（双击判定与悬停轮询可能撞上）：先用旧快照，别排队等
         if (Interlocked.CompareExchange(ref _scanning, 1, 0) != 0) return;
         try
         {
             long start = Environment.TickCount64;
-            var items = Uia.EnumItems(hwnd);
+            var items = Uia.EnumItems(hwnd, tab);
 
             Native.GetWindowRect(hwnd, out var wr);
             lock (_sync)
@@ -131,6 +143,7 @@ internal sealed class ExplorerItemCache
                 _hwnd = hwnd;
                 _winRect = wr;
                 _title = title;
+                _tab = tab;
                 _refreshedAt = Environment.TickCount64;
                 _titleCheckedAt = _refreshedAt;
                 // 扫描失败（null）时保留旧索引：UIA 偶发失败不该让悬停整体失效；

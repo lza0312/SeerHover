@@ -28,13 +28,14 @@ internal static class MediaSize
     }
 
     private const int SyncWaitMs = 600;
+    private const int CacheTtlMs = 600_000;
 
     private static readonly object Sync = new();
     private static readonly Dictionary<string, Entry> Cache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> InFlight = new(StringComparer.OrdinalIgnoreCase);
     private static readonly BlockingCollection<Job> Queue = new();
 
-    private static readonly string[] VideoExt =
+    internal static readonly string[] VideoExt =
     {
         ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".rmvb", ".3gp"
     };
@@ -82,6 +83,15 @@ internal static class MediaSize
         catch { }
     }
 
+    /// <summary>
+    /// 缓存是否可用。必须【读】和【写】共用同一套判断：
+    /// 以前 TryCached 检查 10 分钟 TTL，而 Enqueue 只比修改时间，
+    /// 结果长驻进程跑过 10 分钟后，过期条目仍让 Enqueue 直接返回 null，
+    /// Probe 于是永远拿到 (0,0)，几何退化成固定尺寸（横图大黑框）。
+    /// </summary>
+    private static bool Fresh(Entry e, DateTime stamp)
+        => e.Stamp == stamp && Environment.TickCount64 - e.At < CacheTtlMs;
+
     private static bool TryCached(string path, out (int W, int H) size)
     {
         size = (0, 0);
@@ -93,8 +103,7 @@ internal static class MediaSize
 
             lock (Sync)
             {
-                if (Cache.TryGetValue(path, out var e) && e.Stamp == stamp &&
-                    Environment.TickCount64 - e.At < 600_000)
+                if (Cache.TryGetValue(path, out var e) && Fresh(e, stamp))
                 {
                     size = (e.W, e.H);
                     return true;
@@ -121,7 +130,7 @@ internal static class MediaSize
         Job? job = null;
         lock (Sync)
         {
-            if (Cache.TryGetValue(path, out var e) && e.Stamp == stamp) return null;
+            if (Cache.TryGetValue(path, out var e) && Fresh(e, stamp)) return null;
             if (!wait)
             {
                 if (InFlight.Contains(path)) return null;   // 已有预热在排队/执行
@@ -220,7 +229,25 @@ internal static class MediaSize
                 FileShare.ReadWrite | FileShare.Delete);
             using var img = System.Drawing.Image.FromStream(fs,
                 useEmbeddedColorManagement: false, validateImageData: false);
-            if (img.Width > 0 && img.Height > 0) return (img.Width, img.Height);
+            if (img.Width > 0 && img.Height > 0)
+            {
+                int w = img.Width, h = img.Height;
+                // EXIF 方向：很多手机照片文件头是横的，但标记为旋转 90°，Seer 按方向显示成竖图。
+                // 不交换的话我们会按横图算出一个横窗口，图片只能居中显示 → 左右两条大黑边。
+                try
+                {
+                    foreach (int id in img.PropertyIdList)
+                    {
+                        if (id != 0x0112) continue;   // PropertyTagOrientation
+                        var prop = img.GetPropertyItem(id);
+                        if (prop?.Value is { Length: > 0 } bytes && bytes[0] >= 5 && bytes[0] <= 8)
+                            (w, h) = (h, w);
+                        break;
+                    }
+                }
+                catch { }
+                return (w, h);
+            }
         }
         catch { }
 

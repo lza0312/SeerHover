@@ -26,8 +26,9 @@ internal sealed class HoverResolver
 
     private readonly AppConfig _cfg;
 
-    // 文件夹路径缓存：按句柄 + 短 TTL，避免每次移动都走一遍 Shell.Application（COM 调用很贵）
-    private readonly Dictionary<IntPtr, (string Path, long At)> _folderCache = new();
+    // 文件夹路径缓存：按句柄 + 标签序号 + 短 TTL，避免每次移动都走一遍 Shell.Application。
+    // 标签序号必须进 key：多标签共享 HWND，切标签后路径不同，否则 2 秒内拿到上一个标签的路径。
+    private readonly Dictionary<long, (string Path, long At)> _folderCache = new();
 
     private object? _shell;
 
@@ -121,16 +122,18 @@ internal sealed class HoverResolver
     private string GetFolderPath(IntPtr root)
     {
         long now = Environment.TickCount64;
-        if (_folderCache.TryGetValue(root, out var cached) && now - cached.At < 2000)
+        var tab = Uia.ActiveTab(root);
+        long key = ((long)root << 8) | (uint)Math.Clamp(tab.Index, 0, 255);
+        if (_folderCache.TryGetValue(key, out var cached) && now - cached.At < 2000)
             return cached.Path;
 
-        string path = QueryFolderPath(root);
-        if (path.Length > 0) _folderCache[root] = (path, now);
-        else _folderCache.Remove(root);
+        string path = QueryFolderPath(root, tab);
+        if (path.Length > 0) _folderCache[key] = (path, now);
+        else _folderCache.Remove(key);
         return path;
     }
 
-    private string QueryFolderPath(IntPtr root)
+    private string QueryFolderPath(IntPtr root, Uia.TabInfo? tabInfo = null)
     {
         try
         {
@@ -142,6 +145,11 @@ internal sealed class HoverResolver
             }
             if (_shell == null) return string.Empty;
 
+            // Win11 多标签共享同一个顶层 HWND：Shell.Windows() 会对同一 HWND 返回多条。
+            // 这里的顺序同样不保证与 TabItem / DefView 一致，所以先收集 (名称, 路径)，
+            // 再用与 DefView 匹配相同的「标签名」作主键；序号只是兜底。
+            var tab = tabInfo ?? Uia.ActiveTab(root);
+            var paths = new List<(string Name, string Path)>();
             dynamic shell = _shell;
             dynamic windows = shell.Windows();
             int count = (int)windows.Count;
@@ -157,10 +165,34 @@ internal sealed class HoverResolver
                 {
                     dynamic self = w.Document.Folder.Self;
                     string p = (string)self.Path;
-                    if (!string.IsNullOrEmpty(p)) return p;
+                    if (string.IsNullOrEmpty(p)) continue;
+                    string n = string.Empty;
+                    try { n = ((string)w.LocationName ?? string.Empty).Trim(); }
+                    catch { }
+                    paths.Add((n, p));
                 }
-                catch { return string.Empty; }
+                catch { }
             }
+
+            if (paths.Count == 0) return string.Empty;
+
+            if (tab.HasName)
+            {
+                for (int i = 0; i < paths.Count; i++)
+                    if (string.Equals(paths[i].Name, tab.Name, StringComparison.OrdinalIgnoreCase))
+                        return paths[i].Path;
+
+                // LocationName 偶尔带 "(2)" 之类的后缀，放宽成前缀匹配
+                for (int i = 0; i < paths.Count; i++)
+                {
+                    if (paths[i].Name.Length == 0) continue;
+                    if (tab.Name.StartsWith(paths[i].Name, StringComparison.OrdinalIgnoreCase) ||
+                        paths[i].Name.StartsWith(tab.Name, StringComparison.OrdinalIgnoreCase))
+                        return paths[i].Path;
+                }
+            }
+            if (tab.Index >= 0 && tab.Index < paths.Count) return paths[tab.Index].Path;
+            return paths[^1].Path;
         }
         catch (Exception ex)
         {

@@ -141,21 +141,26 @@ internal sealed class ExplorerUp : IDisposable
 
     private void Handle(IntPtr root, Native.POINT pt, string titleBefore)
     {
-        // 先让资源管理器处理完这次双击（空白处它什么都不做，不会和后续按键打架）
-        Thread.Sleep(140);
         if (!_enabled()) return;
         if (!Native.IsWindow(root)) return;
 
-        // 标题变了 = 这次双击已经让窗口跳到了别的目录（双击的是文件夹），不掺和
-        if (!string.Equals(Native.TitleOf(root), titleBefore, StringComparison.Ordinal))
-        {
-            Logger.Info("double-click: folder changed, ignored");
-            return;
-        }
-
+        // 空白判定用「点击那一刻」的状态，不用等资源管理器处理完双击：
+        // 项矩形来自悬停时的共享缓存（纯内存命中）；点在项的格子上时，
+        // 第一次点击就已经把它选中了，选中数此时就是最终值。
         if (!IsEmptyItemsArea(root, pt))
         {
             Logger.Info("double-click: not empty items area, ignored");
+            return;
+        }
+
+        // 只留很短的一拍：让资源管理器把这次双击处理完（空白处它什么都不做），
+        // 再合成 Alt+↑，避免按键和双击处理撞车。标题变化仍作兜底——万一这次
+        // 双击其实让窗口跳了目录（比如点在某个漏判的项上），就不退层。
+        Thread.Sleep(60);
+        if (!_enabled() || !Native.IsWindow(root)) return;
+        if (!string.Equals(Native.TitleOf(root), titleBefore, StringComparison.Ordinal))
+        {
+            Logger.Info("double-click: folder changed, ignored");
             return;
         }
 

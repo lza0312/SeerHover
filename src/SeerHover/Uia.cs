@@ -67,30 +67,45 @@ internal static class Uia
     private static StaRunner? _sta;
     private static StaRunner Runner => _sta ??= new StaRunner();
 
+    /// <summary>
+    /// 一个标签的身份。多标签共享顶层 HWND，序号在 Shell.Windows()/DefView 里都不可靠，
+    /// 名称才是三者（TabItem / Shell.LocationName / ShellTabWindowClass.Name）共用的键。
+    /// </summary>
+    public readonly record struct TabInfo(int Index, string Name)
+    {
+        public bool HasName => !string.IsNullOrEmpty(Name);
+    }
+
     /// <summary>枚举窗口内所有文件项（名字 + 屏幕矩形）。</summary>
     public static List<ExplorerItem>? EnumItems(IntPtr hwnd)
+        => Runner.Run(() => EnumItemsCore(hwnd, ActiveTabCore(hwnd)), 3000);
+
+    /// <summary>按指定标签枚举文件项；调用方（缓存）保证标签与文件夹路径一致。</summary>
+    public static List<ExplorerItem>? EnumItems(IntPtr hwnd, TabInfo tab)
+        => Runner.Run(() => EnumItemsCore(hwnd, tab), 3000);
+
+    private static List<ExplorerItem>? EnumItemsCore(IntPtr hwnd, TabInfo tab)
     {
-        return Runner.Run(() =>
+        try
         {
-            try
-            {
-                var root = AutomationElement.FromHandle(hwnd);
-                if (root == null) return null;
+            var root = AutomationElement.FromHandle(hwnd);
+            if (root == null) return null;
 
-                // 只扫文件列表子树：导航窗格 / 功能区不在里面，元素少一大截
-                var scope = ItemsViewScope(hwnd) ?? root;
-                var list = ReadItems(scope);
+            // 只扫文件列表子树：导航窗格 / 功能区不在里面，元素少一大截。
+            // 多标签页下会有多个 DefView（矩形完全相同），必须按激活标签的【名字】取对应那个：
+            // DefView 的枚举顺序与 TabItem / Shell.Windows() 顺序不保证一致（实测可能完全相反）。
+            var scope = ItemsViewScopeCore(hwnd, tab) ?? root;
+            var list = ReadItems(scope);
 
-                // 换了版本/皮肤导致子树里取不到项时，退回整窗口再扫一遍
-                if (list.Count == 0 && !ReferenceEquals(scope, root)) list = ReadItems(root);
-                return list;
-            }
-            catch (Exception ex)
-            {
-                Logger.Error("enum items: " + ex.Message);
-                return null;
-            }
-        }, 3000);
+            // 换了版本/皮肤导致子树里取不到项时，退回整窗口再扫一遍
+            if (list.Count == 0 && !ReferenceEquals(scope, root)) list = ReadItems(root);
+            return list;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("enum items: " + ex.Message);
+            return null;
+        }
     }
 
     /// <summary>
@@ -98,9 +113,9 @@ internal static class Uia
     /// 注意：SHELLDLL_DefView 在 UIA 里的 ClassName 是 DUIListView（和 Win32 类名不同），
     /// 所以这里只按 Win32 类名拿到句柄，是否可用由「扫出来的项数」来兜底，不再比对类名。
     /// </summary>
-    private static AutomationElement? ItemsViewScope(IntPtr hwnd)
+    private static AutomationElement? ItemsViewScopeCore(IntPtr hwnd, TabInfo tab)
     {
-        IntPtr view = Native.ItemsViewOf(hwnd);
+        IntPtr view = ActiveItemsViewCore(hwnd, tab);
         if (view == IntPtr.Zero) return null;
         try
         {
@@ -110,6 +125,41 @@ internal static class Uia
             return box.Width > 40 && box.Height > 40 ? el : null;
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// 找到当前激活标签对应的 SHELLDLL_DefView。
+    /// 关键：不按序号取——Win11 里 DefView 的 Z 序 / 枚举顺序与 TabItem 顺序无关。
+    /// 沿 DefView 的 UIA 祖先链找到 ShellTabWindowClass，它的 Name 就是标签名。
+    /// </summary>
+    private static IntPtr ActiveItemsViewCore(IntPtr hwnd, TabInfo tab)
+    {
+        try
+        {
+            var views = Native.FindAllClass(hwnd, 8, "SHELLDLL_DefView");
+            if (views.Count == 0) return IntPtr.Zero;
+            if (views.Count == 1 || !tab.HasName) return views[0];
+
+            for (int i = 0; i < views.Count; i++)
+            {
+                string owner = ViewOwnerNameCore(views[i]);
+                if (owner.Length > 0 && string.Equals(owner, tab.Name, StringComparison.OrdinalIgnoreCase))
+                    return views[i];
+            }
+
+            // 标签名对不上（特殊文件夹/改名）时退一步：取 UIA 报告为可见的那个 DefView。
+            for (int i = 0; i < views.Count; i++)
+            {
+                try
+                {
+                    var el = AutomationElement.FromHandle(views[i]);
+                    if (el != null && !el.Current.IsOffscreen) return views[i];
+                }
+                catch { }
+            }
+            return views[0];
+        }
+        catch { return IntPtr.Zero; }
     }
 
     /// <summary>
@@ -181,6 +231,172 @@ internal static class Uia
             });
         }
     }
+
+    /// <summary>诊断：选中指定序号的标签（只用于 --select-tab 自检）。</summary>
+    public static bool SelectTab(IntPtr hwnd, int index)
+        => Runner.Run(() =>
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                if (root == null) return false;
+                var cond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem);
+                var tabs = root.FindAll(TreeScope.Descendants, cond);
+                if (index < 0 || index >= tabs.Count) return false;
+                if (!tabs[index].TryGetCurrentPattern(SelectionItemPattern.Pattern, out object p)) return false;
+                ((SelectionItemPattern)p).Select();
+                return true;
+            }
+            catch { return false; }
+        }, 2000);
+
+    /// <summary>当前激活标签（序号 + 名称）。单标签/无法确定时名称为空、序号 0。</summary>
+    public static TabInfo ActiveTab(IntPtr hwnd) => Runner.Run(() => ActiveTabCore(hwnd), 1200);
+
+    /// <summary>只能在 STA Runner 的 job 里调用，避免嵌套 Runner 造成 1.2 秒空等。</summary>
+    private static TabInfo ActiveTabCore(IntPtr hwnd)
+    {
+        try
+        {
+            var root = AutomationElement.FromHandle(hwnd);
+            if (root == null) return default;
+            var cond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem);
+            var tabs = root.FindAll(TreeScope.Descendants, cond);
+            for (int i = 0; i < tabs.Count; i++)
+            {
+                try
+                {
+                    if (tabs[i].TryGetCurrentPattern(SelectionItemPattern.Pattern, out object p) &&
+                        ((SelectionItemPattern)p).Current.IsSelected)
+                        return new TabInfo(i, (tabs[i].Current.Name ?? string.Empty).Trim());
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return default;
+    }
+
+    public static int SelectedTabIndex(IntPtr hwnd) => ActiveTab(hwnd).Index;
+
+    /// <summary>诊断：Shell.Windows() 里同一 HWND 对应的所有 folder path（多标签会有多条）。</summary>
+    public static string ShellPaths(IntPtr hwnd)
+    {
+        try
+        {
+            var t = Type.GetTypeFromProgID("Shell.Application");
+            if (t == null) return "no Shell.Application";
+            dynamic shell = Activator.CreateInstance(t)!;
+            dynamic windows = shell.Windows();
+            var sb = new StringBuilder();
+            int count = (int)windows.Count;
+            sb.Append($"count={count}");
+            for (int i = 0; i < count; i++)
+            {
+                try
+                {
+                    dynamic w = windows.Item(i);
+                    long h = (long)w.HWND;
+                    if (new IntPtr(h) != hwnd) continue;
+                    string p = (string)w.Document.Folder.Self.Path;
+                    string n = (string)w.LocationName;
+                    sb.Append($"\n  [{i}] path='{p}' name='{n}'");
+                }
+                catch { }
+            }
+            return sb.ToString();
+        }
+        catch (Exception ex) { return "ERR " + ex.Message; }
+    }
+
+    /// <summary>诊断：整窗口里所有 TabItem 的选中状态，用于定位当前激活标签。</summary>
+    public static string TabItems(IntPtr hwnd)
+        => Runner.Run(() =>
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                if (root == null) return "null";
+                var cond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem);
+                var tabs = root.FindAll(TreeScope.Descendants, cond);
+                var sb = new StringBuilder();
+                sb.Append($"TabItem count={tabs.Count}");
+                for (int i = 0; i < tabs.Count; i++)
+                {
+                    var t = tabs[i];
+                    string n = (t.Current.Name ?? "").Trim();
+                    bool sel = false;
+                    try
+                    {
+                        if (t.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object p))
+                            sel = ((SelectionItemPattern)p).Current.IsSelected;
+                    }
+                    catch { }
+                    sb.Append($"\n  [{i}] '{n}' selected={sel}");
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex) { return "ERR " + ex.Message; }
+        }, 3000);
+
+    /// <summary>某个 DefView 沿祖先链找到它归属的 ShellTabWindowClass 名字（即标签名）。</summary>
+    private static string ViewOwnerNameCore(IntPtr view)
+    {
+        try
+        {
+            var el = AutomationElement.FromHandle(view);
+            if (el == null) return string.Empty;
+            for (int i = 0; i < 10 && el != null; i++)
+            {
+                string c = el.Current.ClassName ?? string.Empty;
+                string n = (el.Current.Name ?? string.Empty).Trim();
+                if (c == "ShellTabWindowClass") return n;
+                el = TreeWalker.ControlViewWalker.GetParent(el);
+            }
+        }
+        catch { }
+        return string.Empty;
+    }
+
+    public static string ViewOwnerTabName(IntPtr view) => Runner.Run(() => ViewOwnerNameCore(view), 2000);
+
+    /// <summary>诊断：某个 DefView 的完整祖先链。</summary>
+    public static string ViewOwnerTab(IntPtr view)
+        => Runner.Run(() =>
+        {
+            try
+            {
+                var el = AutomationElement.FromHandle(view);
+                if (el == null) return "null";
+                var parts = new List<string>();
+                for (int i = 0; i < 10 && el != null; i++)
+                {
+                    string c = el.Current.ClassName ?? "";
+                    string n = (el.Current.Name ?? "").Trim();
+                    parts.Add($"{c}:'{n}'");
+                    if (c == "ShellTabWindowClass") break;
+                    el = TreeWalker.ControlViewWalker.GetParent(el);
+                }
+                return string.Join(" <- ", parts);
+            }
+            catch (Exception ex) { return "ERR " + ex.Message; }
+        }, 3000);
+
+    /// <summary>诊断：某个 DefView 的 UIA 属性（IsOffscreen / 项数 / 前几项名字）。多标签页用来区分激活标签。</summary>
+    public static string ViewInfo(IntPtr view)
+        => Runner.Run(() =>
+        {
+            try
+            {
+                var el = AutomationElement.FromHandle(view);
+                if (el == null) return "null";
+                bool off = el.Current.IsOffscreen;
+                var items = ReadItems(el);
+                string first = items.Count > 0 ? items[0].Name : "(none)";
+                return $"offscreen={off} items={items.Count} first='{first}'";
+            }
+            catch (Exception ex) { return "ERR " + ex.Message; }
+        }, 3000);
 
     /// <summary>诊断：直接扫某个窗口/元素子树，返回项数与耗时（用于对比扫描范围）。</summary>
     public readonly record struct ScanStat(int Count, double Ms);
@@ -288,8 +504,9 @@ internal static class Uia
                 var root = AutomationElement.FromHandle(hwnd);
                 if (root == null) return -1;
 
-                // 先只看文件列表子树（导航窗格里的 List 不算），拿不到再退回整窗口
-                var scope = ItemsViewScope(hwnd) ?? root;
+                // 先只看文件列表子树（导航窗格里的 List 不算），拿不到再退回整窗口。
+                // 这里已经在 Runner 的 job 里，必须用 *Core 版本，不能再嵌套 Runner。
+                var scope = ItemsViewScopeCore(hwnd, ActiveTabCore(hwnd)) ?? root;
                 int n = CountSelected(scope);
                 if (n >= 0) return n;
                 if (!ReferenceEquals(scope, root)) return CountSelected(root);
@@ -368,5 +585,60 @@ internal static class Uia
                 return $"ERR {ex.GetType().Name}: {ex.Message}";
             }
         });
+    }
+
+    /// <summary>
+    /// 诊断用：递归 dump 一个窗口的完整 UIA 树（名字 / 类名 / 矩形 / 可用 Pattern）。
+    /// 用于排查 Seer 预览窗的媒体控件（播放 / 进度 / 静音）暴露情况。
+    /// </summary>
+    public static string DumpTree(IntPtr hwnd, int maxDepth = 8, int maxNodes = 200)
+    {
+        return Runner.Run(() =>
+        {
+            var sb = new System.Text.StringBuilder();
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                if (root == null) return "null";
+                int count = 0;
+                void Walk(AutomationElement el, int depth, string pad)
+                {
+                    if (depth > maxDepth || count >= maxNodes) return;
+                    count++;
+                    string n = "", c = "", t = "";
+                    var pats = new List<string>();
+                    try
+                    {
+                        n = (el.Current.Name ?? string.Empty).Trim();
+                        c = el.Current.ClassName ?? string.Empty;
+                        t = el.Current.ControlType?.ProgrammaticName ?? "?";
+                        var all = el.GetSupportedPatterns();
+                        foreach (var p in all) pats.Add(p.ProgrammaticName.Replace("PatternIdentifiers.Pattern", "").Replace("Pattern", ""));
+                    }
+                    catch { }
+                    string rect = "";
+                    try
+                    {
+                        var r = el.Current.BoundingRectangle;
+                        rect = r.IsEmpty ? "" : $" [{(int)r.X},{(int)r.Y} {(int)r.Width}x{(int)r.Height}]";
+                    }
+                    catch { }
+                    sb.AppendLine($"{pad}{t}:'{n}' {c}{rect} ({string.Join(",", pats)})");
+                    try
+                    {
+                        var kids = el.FindAll(TreeScope.Children, Condition.TrueCondition);
+                        foreach (AutomationElement k in kids) Walk(k, depth + 1, pad + "  ");
+                    }
+                    catch { }
+                }
+                Walk(root, 0, "");
+                if (count >= maxNodes) sb.AppendLine($"... (截断，共 {count}+ 节点)");
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine("ERR " + ex.Message);
+            }
+            return sb.ToString();
+        }, 8000);
     }
 }

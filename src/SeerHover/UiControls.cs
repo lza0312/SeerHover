@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Text;
 using System.Windows.Forms;
 
 namespace SeerHover;
@@ -9,25 +10,60 @@ internal sealed class WrapLabel : Control
 {
     public WrapLabel()
     {
-        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
-                 | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor | ControlStyles.Selectable, true);
+        // 不用 OptimizedDoubleBuffer：设置窗里多行说明只有最后一行可见，
+        // 是双缓冲 + 局部 Invalidate 的合成问题（单独渲染同一控件三行都正常）。
+        SetStyle(ControlStyles.UserPaint | ControlStyles.ResizeRedraw
+                 | ControlStyles.SupportsTransparentBackColor | ControlStyles.Selectable, true);
         BackColor = Color.Transparent;
         TabStop = false;
     }
 
-    /// <summary>给定宽度下需要的高度（设备像素），用于按内容撑行高。</summary>
-    public int MeasureHeight(int width)
+    /// <summary>
+    /// 自己按字符折行。GDI 的 DT_WORDBREAK 对纯中文长文案会漏画首行（实测设置页说明只剩后半截），
+    /// 所以这里显式算出每行，绘制和测量用同一份结果，行数一定对得上。
+    /// </summary>
+    internal List<string> Lines(int width)
     {
-        if (string.IsNullOrEmpty(Text)) return 0;
-        var size = TextRenderer.MeasureText(Text, Font, new Size(Math.Max(10, width), int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
-        return size.Height;
+        var lines = new List<string>();
+        if (string.IsNullOrEmpty(Text)) return lines;
+
+        int limit = Math.Max(10, width);
+        var flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+        var sb = new StringBuilder();
+        foreach (char c in Text)
+        {
+            if (c == '\n') { lines.Add(sb.ToString()); sb.Clear(); continue; }
+            sb.Append(c);
+            var size = TextRenderer.MeasureText(sb.ToString(), Font, Size.Empty, flags);
+            if (size.Width > limit && sb.Length > 1)
+            {
+                lines.Add(sb.ToString(0, sb.Length - 1));
+                sb.Clear();
+                sb.Append(c);
+            }
+        }
+        if (sb.Length > 0) lines.Add(sb.ToString());
+        return lines;
     }
+
+    private int LineHeight => Math.Max(TextRenderer.MeasureText("字", Font).Height, Font.Height);
+
+    /// <summary>给定宽度下需要的高度（设备像素），用于按内容撑行高。</summary>
+    public int MeasureHeight(int width) => Lines(width).Count * LineHeight + 2;
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor,
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.Top);
+        var lines = Lines(Width);
+        int lh = LineHeight;
+        int top = Math.Max(0, (Height - lines.Count * lh) / 2);
+        var flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.Left | TextFormatFlags.VerticalCenter;
+        for (int i = 0; i < lines.Count; i++)
+        {
+            int y = top + i * lh;
+            if (y + lh > Height + 2) break;
+            TextRenderer.DrawText(e.Graphics, lines[i], Font,
+                new Rectangle(0, y, Width, Math.Min(lh, Height - y)), ForeColor, flags);
+        }
     }
 }
 
@@ -38,6 +74,18 @@ internal sealed class WrapLabel : Control
 internal sealed class SettingRow : Panel
 {
     private readonly Action<SettingRow, int> _arrange;
+
+    /// <summary>
+    /// 行是否参与布局。不能用 WinForms 的 Visible 判断：页面隐藏期间子控件
+    /// 的 Visible 也返回 false，卡片重排会把所有行都当成隐藏行折叠掉。
+    /// </summary>
+    public bool RowVisible { get; set; } = true;
+
+    /// <summary>
+    /// 与上一行同组（如分类策略行 + 它的宽高行）：卡片加分隔线时跳过，
+    /// 分隔只在两组之间出现，不会夹在宽高滑杆行的上下。
+    /// </summary>
+    public bool GroupWithPrev { get; set; }
 
     public SettingRow(Action<SettingRow, int> arrange)
     {
@@ -524,6 +572,7 @@ internal sealed class NavRail : Control
     public List<string> Items { get; } = new();
     public string Header { get; set; } = "SeerHover";
     public string SubHeader { get; set; } = "";
+    public string SubHeader2 { get; set; } = "";   // 版本号等第三行
 
     public event EventHandler? SelectedIndexChanged;
 
@@ -571,6 +620,8 @@ internal sealed class NavRail : Control
         TextRenderer.DrawText(g, Header, Theme.H1, new Point((int)(20 * s), (int)(22 * s)), Theme.Text, TextFormatFlags.NoPrefix);
         if (SubHeader.Length > 0)
             TextRenderer.DrawText(g, SubHeader, Theme.Small, new Point((int)(21 * s), (int)(48 * s)), Theme.Muted, TextFormatFlags.NoPrefix);
+        if (SubHeader2.Length > 0)
+            TextRenderer.DrawText(g, SubHeader2, Theme.Small, new Point((int)(21 * s), (int)(66 * s)), Theme.Muted, TextFormatFlags.NoPrefix);
 
         for (int i = 0; i < Items.Count; i++)
         {
@@ -589,7 +640,7 @@ internal sealed class NavRail : Control
 
             var col = i == _index ? Theme.Text : Theme.Muted;
             var f = i == _index ? Theme.BodyStrong : Theme.Body;
-            var textRect = new Rectangle(r.X + (int)(22 * s), r.Y, r.Width - (int)(30 * s), r.Height);
+            var textRect = new Rectangle(r.X + (int)(10 * s), r.Y, r.Width - (int)(18 * s), r.Height);
             TextRenderer.DrawText(g, Items[i], f, textRect, col,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
@@ -708,7 +759,7 @@ internal sealed class CardPanel : Panel
 
     public void AddRow(Control row)
     {
-        if (_items.Count > 0)
+        if (_items.Count > 0 && !(row is SettingRow sr && sr.GroupWithPrev))
         {
             var sep = new Panel { BackColor = Theme.Border, Height = 1 };
             _items.Add(sep);
@@ -718,17 +769,45 @@ internal sealed class CardPanel : Panel
         Controls.Add(row);
     }
 
-    /// <summary>按新的卡片宽度重排所有行（行自己会重算高度）。</summary>
+    /// <summary>按新的卡片宽度重排所有行（行自己会重算高度）。RowVisible=false 的行不占位。</summary>
     public void Reflow(int width)
     {
         if (width <= 0) return;
         SuspendLayout();
         Width = width;
         int inner = Math.Max(1, width - PadH * 2);
+
+        // 分隔线只画在两个「都参与布局」的分组之间：
+        // 行可整组隐藏（分类 + 参数行），所以往前/往后各扫到第一行可见行为准，
+        // 不能只看紧邻一行——否则上一组尾部参数行隐藏时会把分类之间的线误吞掉。
+        var shown = new List<Control>();
+        for (int i = 0; i < _items.Count; i++)
+        {
+            var c = _items[i];
+            bool isSep = c is Panel && c is not SettingRow;
+            if (isSep)
+            {
+                bool prevVis = false;
+                for (int j = shown.Count - 1; j >= 0; j--)
+                    if (shown[j] is SettingRow s1 && s1.RowVisible) { prevVis = true; break; }
+                bool nextVis = false;
+                for (int j = i + 1; j < _items.Count; j++)
+                    if (_items[j] is SettingRow s2) { nextVis = s2.RowVisible; break; }
+                c.Visible = prevVis && nextVis;
+            }
+            else if (c is SettingRow sr)
+            {
+                sr.Visible = sr.RowVisible;
+                shown.Add(sr);
+            }
+        }
+
         int y = PadV;
         foreach (var c in _items)
         {
-            if (c is SettingRow sr) sr.Arrange(inner);
+            if (c is SettingRow sr && !sr.RowVisible) continue;
+            if (c is Panel && c is not SettingRow && !c.Visible) continue;   // 分隔线
+            if (c is SettingRow sr2) sr2.Arrange(inner);
             c.SetBounds(PadH, y, inner, c.Height);
             y += c.Height;
         }

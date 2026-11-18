@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
@@ -6,6 +7,36 @@ namespace SeerHover;
 
 internal static class Program
 {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
+
+    /// <summary>托盘 / 标题栏 / Alt+Tab 共用同一个图标；单文件发布时从嵌入资源读取。
+    /// size > 0 时取 ICO 里对应尺寸的原图（托盘用 16px 才不会被缩放糊掉）。</summary>
+    internal static Icon AppIcon(int size = 0)
+    {
+        try
+        {
+            using var stream = typeof(Program).Assembly.GetManifestResourceStream("SeerHover.AppIcon");
+            if (stream != null)
+            {
+                if (size > 0)
+                {
+                    try
+                    {
+                        var exact = new Icon(stream, size, size);
+                        if (exact.Width > 0) return exact;
+                    }
+                    catch { stream.Position = 0; }
+                }
+                var icon = new Icon(stream);
+                if (icon.Width > 0 && icon.Height > 0) return icon;
+                icon.Dispose();
+            }
+        }
+        catch { }
+        return SystemIcons.Application;
+    }
+
     /// <summary>诊断命令表。新增命令只改这张表，入口不再维护一长串 switch。</summary>
     private static Dictionary<string, Func<int>> Commands(string[] args) =>
         new(StringComparer.OrdinalIgnoreCase)
@@ -22,8 +53,33 @@ internal static class Program
             ["--items"] = () => Cli.Run(Cli.Items, "items"),
             ["--ipc"] = () => Cli.Run(() => Cli.IpcTest(args.Length > 1 ? args[1] : null), "ipc"),
             ["--v2"] = () => Cli.Run(() => Cli.V2Test(args.Length > 1 ? args[1] : null), "v2"),
+            ["--tabs"] = () => Cli.Run(Cli.Tabs, "tabs"),
+            ["--resolve-at"] = () => Cli.Run(Cli.ResolveAt, "resolveat"),
+            ["--select-tab"] = () => Cli.Run(() => Cli.SelectTab(args), "selecttab"),
             ["--media"] = () => Cli.Run(() => Cli.MediaInfo(args.Length > 1 ? args[1] : null), "media"),
+            ["--geom-plan"] = () => Cli.Run(() => Cli.GeomPlan(args), "geomplan"),
+            ["--shot-preview"] = () => Cli.Run(() => Cli.ShotPreview(args), "shotpreview"),
+            ["--switch-test"] = () => Cli.Run(() => Cli.SwitchTest(args), "switchtest"),
+            ["--legacy-test"] = () => Cli.Run(() => Cli.LegacyTest(args), "legacytest"),
+            ["--make-alpha"] = () => Cli.Run(() => Cli.MakeAlpha(args), "makealpha"),
+            ["--media-shot"] = () => Cli.Run(() => Cli.MediaShot(args), "mediashot"),
+            ["--bg-cycle"] = () => Cli.Run(() => Cli.BgCycle(args), "bgcycle"),
+            ["--bg-next"] = () => Cli.Run(Cli.BgNext, "bgnext"),
+            ["--upscale"] = () => Cli.Run(() => Cli.Upscale(args), "upscale"),
+            ["--settings-shot"] = () => Cli.Run(() => Cli.SettingsShot(args), "settingsshot"),
+            ["--crop"] = () => Cli.Run(() => Cli.Crop(args), "crop"),
+            ["--wrap-test"] = () => Cli.Run(() => Cli.WrapTest(args), "wraptest"),
             ["--windows"] = () => Cli.Run(Cli.SeerWindows, "windows"),
+            ["--uia-seer"] = () => Cli.Run(Cli.UiaSeer, "uiaseer"),
+            ["--v2-call"] = () => Cli.Run(() => Cli.V2Call(args), "v2call"),
+            ["--make-test-video"] = () => Cli.Run(() => Cli.MakeTestVideo(args), "maketestvideo"),
+            ["--media-key-test"] = () => Cli.Run(() => Cli.MediaKeyTest(args), "mediakeytest"),
+            ["--bar-shot"] = () => Cli.Run(() => Cli.BarShot(args), "barshot"),
+            ["--overlay-probe"] = () => Cli.Run(() => Cli.OverlayProbe(args), "overlayprobe"),
+            ["--audio-probe"] = () => Cli.Run(Cli.AudioProbe, "audioprobe"),
+            ["--audio-discover"] = () => Cli.Run(Cli.AudioDiscover, "audiodiscover"),
+            ["--balloon-test"] = () => Cli.Run(Cli.BalloonTest, "balloontest"),
+            ["--anchor-diag"] = () => Cli.Run(() => Cli.AnchorDiag(args), "anchordiag"),
             ["--fix-tracking"] = () => Cli.Run(Cli.FixTracking, "fixtracking"),
             ["--keep-window"] = () => Cli.Run(Cli.KeepWindow, "keepwindow"),
             ["--restore-window"] = () => Cli.Run(Cli.RestoreWindow, "restorewindow"),
@@ -58,6 +114,12 @@ internal static class Program
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 1;
         }
+
+        // 显式 AppUserModelID：toast 通知按应用身份缓存图标，不定 AUMID 时 Windows 用
+        // 自动派生身份，旧缓存会一直显示占位图标（用户实测 toast 图标是空白折角文档）。
+        // 新 AUMID → 图标缓存重新读 exe 资源，此后身份稳定不再漂移。
+        try { SetCurrentProcessExplicitAppUserModelID("SeerHover.Tray"); }
+        catch { /* 旧系统没有该导出也不影响主功能 */ }
 
         bool openSettings = args.Any(a => string.Equals(a, "--settings", StringComparison.OrdinalIgnoreCase));
 

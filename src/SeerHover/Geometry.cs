@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace SeerHover;
 
 /// <summary>
@@ -22,9 +24,16 @@ namespace SeerHover;
 /// </summary>
 internal sealed class GeometryController
 {
+    /// <summary>一次几何计算的结果：最终窗口尺寸 + 要发给 Seer 的位置。</summary>
+    private readonly record struct GeometryResult(int W, int H, Native.RECT Rect);
+
     private readonly AppConfig _cfg;
     private readonly SeerIpc _ipc;
     private CancellationTokenSource? _cts;
+
+    /// <summary>诊断开关：由 --geom-plan 打开，记录每个方向的计算过程。</summary>
+    public static bool DebugPlans;
+    public static string LastPlanDebug { get; private set; } = string.Empty;
 
     /// <summary>Seer 的最小窗口尺寸（首次被夹后学习到的值，物理像素）</summary>
     private static int _floorW;
@@ -36,6 +45,10 @@ internal sealed class GeometryController
     /// <summary>固定尺寸的硬上限：8K（7680×4320），4K / 5K2K 带鱼屏都在范围内</summary>
     public const int MaxFixedW = 7680;
     public const int MaxFixedH = 4320;
+
+    /// <summary>固定尺寸的软下限：320×240（音频等类别的小窗预览）。</summary>
+    public const int MinFixedW = 320;
+    public const int MinFixedH = 240;
 
     public GeometryController(AppConfig cfg, SeerIpc ipc)
     {
@@ -53,26 +66,86 @@ internal sealed class GeometryController
     /// <summary>
     /// 只算目标几何、不碰窗口。供 V2 的 preview.open(rect) 在触发预览前同步取 rect：
     /// rect 必须和路径一起发出去，才能禁掉 Seer 的 content-fit 自动缩放。
-    /// 返回 null 表示 sizeMode=seer（完全交给 Seer）。
+    /// 返回 null 表示该类别走 seer 尺寸（完全交给 Seer）。
     /// </summary>
     public Native.RECT? Plan(HoverTarget target, Native.POINT cursor)
     {
+        if (EffectiveSizeMode(_cfg.Geometry, target.Path) == "seer") return null;
+        return Compute(target, cursor, default, preSet: true).Rect;
+    }
+
+    /// <summary>
+    /// 该文件最终生效的尺寸策略：先查按类别的覆盖（Geometry.CategoryModes），
+    /// 没有覆盖或覆盖值为空时回落到全局 SizeMode。
+    /// </summary>
+    public static string EffectiveSizeMode(GeometryConfig cfg, string path)
+    {
+        if (cfg.CategoryModes != null &&
+            cfg.CategoryModes.TryGetValue(MediaKind.Of(path), out var m) &&
+            !string.IsNullOrWhiteSpace(m))
+        {
+            return m.Trim().ToLowerInvariant() switch
+            {
+                "auto" => "auto",
+                "seer" => "seer",
+                "fixed" => "fixed",
+                _ => (cfg.SizeMode ?? "fixed").ToLowerInvariant()
+            };
+        }
+        return (cfg.SizeMode ?? "fixed").ToLowerInvariant();
+    }
+
+    /// <summary>该文件最终生效的「固定尺寸」宽高：按类别覆盖（CategorySizes），缺失用全局 Width/Height。</summary>
+    public static (int W, int H) EffectiveFixedSize(GeometryConfig cfg, string path)
+    {
+        int w = cfg.Width, h = cfg.Height;
+        if (cfg.CategorySizes != null &&
+            cfg.CategorySizes.TryGetValue(MediaKind.Of(path), out var s) &&
+            s is { Length: 2 } && s[0] > 0 && s[1] > 0)
+        {
+            w = s[0];
+            h = s[1];
+        }
+        return (w, h);
+    }
+
+    /// <summary> unify：V2 的 rect 与旧版 SetWindowPos 共用同一套计算，避免两条路径尺寸/位置不一致。 </summary>
+    private GeometryResult Compute(HoverTarget target, Native.POINT cursor, Native.RECT current, bool preSet)
+    {
         var cfg = _cfg.Geometry;
-        string sizeMode = (cfg.SizeMode ?? "fixed").ToLowerInvariant();
-        if (sizeMode == "seer") return null;
-
-        int minW = _floorW > 0 ? _floorW : DefaultMinW;
-        int minH = _floorH > 0 ? _floorH : DefaultMinH;
-
-        int srcW = 0, srcH = 0;
-        if (sizeMode == "auto") (srcW, srcH) = MediaSize.Probe(target.Path);
+        string sizeMode = EffectiveSizeMode(cfg, target.Path);
+        string mode = (cfg.Mode ?? "cursor").ToLowerInvariant();
 
         var mi = Native.MonitorOf(cursor.X, cursor.Y);
         var screen = mi.rcMonitor.IsEmpty ? mi.rcWork : mi.rcMonitor;
         var work = mi.rcWork.IsEmpty ? mi.rcMonitor : mi.rcWork;
 
-        var (width, height) = TargetSize(cfg, sizeMode, srcW, srcH, screen, minW, minH, default);
-        return Place(target, default, work, cfg, width, height, cursor);
+        int minW = _floorW > 0 ? _floorW : DefaultMinW;
+        int minH = _floorH > 0 ? _floorH : DefaultMinH;
+
+        if (sizeMode == "seer")
+        {
+            int sw = current.Width > 0 ? current.Width : minW;
+            int sh = current.Height > 0 ? current.Height : minH;
+            return new GeometryResult(sw, sh, Place(target, current, work, cfg, sw, sh, cursor));
+        }
+
+        // 「光标旁 + 原比例最大化」：尺寸必须先知道往哪边弹，才能按那边的真实可用空间放大，
+        // 否则先按整屏算尺寸再挑方向，就会出现「右下角鼠标、左上空间很大却仍用小窗」。
+        var (cfgW, cfgH) = EffectiveFixedSize(cfg, target.Path);
+        if (sizeMode == "auto" && mode != "fixed" && mode != "corner")
+        {
+            int srcW = 0, srcH = 0;
+            (srcW, srcH) = MediaSize.Probe(target.Path);
+            if ((srcW <= 0 || srcH <= 0) && Logger.IsVerbose)
+                Logger.Info($"geometry: source size unavailable for {target.Name}");
+            return PlanAuto(cursor, work, screen, cfg, srcW, srcH, minW, minH, cfgW, cfgH);
+        }
+
+        int w = 0, h = 0;
+        if (sizeMode == "auto") (w, h) = MediaSize.Probe(target.Path);
+        var (fw, fh) = TargetSize(cfg, sizeMode, cfgW, cfgH, w, h, screen, minW, minH, preSet ? default : current);
+        return new GeometryResult(fw, fh, Place(target, current, work, cfg, fw, fh, cursor));
     }
 
     public void Apply(HoverTarget target, Native.POINT cursor)
@@ -104,27 +177,11 @@ internal sealed class GeometryController
         string sizeMode = (cfg.SizeMode ?? "fixed").ToLowerInvariant();
         bool controlSize = sizeMode != "seer";
 
-        int minW = _floorW > 0 ? _floorW : DefaultMinW;
-        int minH = _floorH > 0 ? _floorH : DefaultMinH;
-
-        // 原比例最大化：取源文件像素尺寸（图片走 WIC，视频走 Shell 属性；命中缓存时零开销）
-        int srcW = 0, srcH = 0;
-        if (controlSize && sizeMode == "auto")
-        {
-            (srcW, srcH) = MediaSize.Probe(target.Path);
-            if (srcW > 0 && Logger.IsVerbose) Logger.Info($"source size: {srcW}x{srcH} for {target.Name}");
-        }
-
         // 0) 抢在 Seer 显示之前设一次：窗口对象在显示前就存在，提前设好尺寸位置，
         //    它显示时就不会先按图片原始尺寸铺开再被我们缩回来。
         if (controlSize && _ipc.Window != IntPtr.Zero)
         {
-            var mi0 = Native.MonitorOf(cursor.X, cursor.Y);
-            var scr0 = mi0.rcMonitor.IsEmpty ? mi0.rcWork : mi0.rcMonitor;
-            var work0 = mi0.rcWork.IsEmpty ? mi0.rcMonitor : mi0.rcWork;
-            var (pw, ph) = TargetSize(cfg, sizeMode, srcW, srcH, scr0, minW, minH,
-                new Native.RECT { Left = 0, Top = 0, Right = Math.Max(minW, cfg.Width), Bottom = Math.Max(minH, cfg.Height) });
-            var pre = Place(target, new Native.RECT(), work0, cfg, pw, ph, cursor);
+            var pre = Compute(target, cursor, default, preSet: true).Rect;
             Native.SetWindowPos(_ipc.Window, IntPtr.Zero, pre.Left, pre.Top,
                 pre.Right - pre.Left, pre.Bottom - pre.Top,
                 Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
@@ -138,10 +195,12 @@ internal sealed class GeometryController
         var mi = Native.MonitorOf(cursor.X, cursor.Y);
         var screen = mi.rcMonitor.IsEmpty ? mi.rcWork : mi.rcMonitor;   // 尺寸上限按整块屏幕算（不是去掉任务栏的工作区）
         var work = mi.rcWork.IsEmpty ? mi.rcMonitor : mi.rcWork;        // 摆放仍按工作区
+        int minW = _floorW > 0 ? _floorW : DefaultMinW;
+        int minH = _floorH > 0 ? _floorH : DefaultMinH;
 
-        var (width, height) = TargetSize(cfg, sizeMode, srcW, srcH, screen, minW, minH, first);
-
-        var rect = Place(target, first, work, cfg, width, height, cursor);
+        var plan = Compute(target, cursor, first, preSet: false);
+        int width = plan.W, height = plan.H;
+        var rect = plan.Rect;
 
         // 3) 设定目标几何，并用 5ms 的高频采样盯着。
         //    Seer 在内容加载完成后会再撑一次（图片会撑到原始尺寸），
@@ -180,9 +239,10 @@ internal sealed class GeometryController
             {
                 if (r.Width > width) _floorW = r.Width;
                 if (r.Height > height) _floorH = r.Height;
-                width = Math.Clamp(r.Width, minW, Math.Max(minW, Math.Min(screen.Width, MaxFixedW)));
-                height = Math.Clamp(r.Height, minH, Math.Max(minH, Math.Min(screen.Height, MaxFixedH)));
-                rect = Place(target, r, work, cfg, width, height, cursor);
+                plan = Compute(target, cursor, r, preSet: false);
+                width = plan.W;
+                height = plan.H;
+                rect = plan.Rect;
                 if (Logger.IsVerbose) Logger.Info($"geometry adopt floor: {width}x{height}");
                 MoveTo(rect.Left, rect.Top, width, height);
                 sets++;
@@ -203,10 +263,195 @@ internal sealed class GeometryController
         if (Logger.IsVerbose) Logger.Info($"geometry settled: {width}x{height} at {rect.Left},{rect.Top} (sets={sets})");
     }
 
+    // ── V2 路径：预摆位 + 盯梢，抹掉「先小后大」的那一帧 ─────────────
+
+    /// <summary>
+    /// Seer 的预览窗口对象在显示之前就已存在。V2 走 preview.open(rect) 时 Seer
+    /// 内部异步应用 rect，窗口会先按上次的尺寸露一帧再变过来（大图/视频很明显）。
+    /// 趁它还没显示，先同步把窗口摆到目标 rect —— 显示出来就是最终大小。
+    /// </summary>
+    public void PrePosition(Native.RECT rect)
+    {
+        try
+        {
+            IntPtr w = _ipc.Window;
+            if (w == IntPtr.Zero || Native.IsWindowVisible(w)) return;
+            Native.SetWindowPos(w, IntPtr.Zero, rect.Left, rect.Top, rect.Width, rect.Height,
+                Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+            if (Logger.IsVerbose) Logger.Info($"geometry preposition: {rect.Width}x{rect.Height} at {rect.Left},{rect.Top}");
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// V2 打开后短盯一会：出现即再钉一次，之后 5ms 采样，Seer 若把窗口改走就拉回目标 rect；
+    /// 被 Seer 最小窗夹大（在目标 1.25 倍内）则接受，不硬顶。
+    /// </summary>
+    public void Watch(Native.RECT rect)
+    {
+        Cancel();
+        var cts = new CancellationTokenSource();
+        Interlocked.Exchange(ref _cts, cts);
+        var token = cts.Token;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                using var _t = Native.TimerResolution.Begin(1);
+
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < 1200)
+                {
+                    if (token.IsCancellationRequested) return;
+                    if (_ipc.IsVisibleFast) break;
+                    Thread.Sleep(2);
+                }
+                if (token.IsCancellationRequested || !_ipc.IsVisibleFast) return;
+
+                MoveTo(rect.Left, rect.Top, rect.Width, rect.Height);
+                int stable = 0, misses = 0;
+                for (int i = 0; i < 40; i++)
+                {
+                    if (token.IsCancellationRequested) return;
+                    Thread.Sleep(5);
+                    if (!_ipc.IsWindowAlive || !_ipc.IsVisibleFast) return;
+
+                    var r = _ipc.GetRect();
+                    if (r.IsEmpty) continue;
+                    bool ok = Math.Abs(r.Width - rect.Width) <= 4 && Math.Abs(r.Height - rect.Height) <= 4 &&
+                              Math.Abs(r.Left - rect.Left) <= 4 && Math.Abs(r.Top - rect.Top) <= 4;
+                    if (ok)
+                    {
+                        if (++stable >= 12) break;
+                        continue;
+                    }
+
+                    // 差异很小且比目标大 → Seer 的最小窗夹取，接受，别再顶
+                    bool near = r.Width <= rect.Width * 1.25 && r.Height <= rect.Height * 1.25;
+                    if (near && r.Width >= rect.Width && r.Height >= rect.Height)
+                    {
+                        if (Logger.IsVerbose) Logger.Info($"geometry watch adopt floor: {r.Width}x{r.Height}");
+                        break;
+                    }
+
+                    stable = 0;
+                    if (++misses > 4) break;
+                    MoveTo(rect.Left, rect.Top, rect.Width, rect.Height);
+                }
+                if (Logger.IsVerbose) Logger.Info("geometry watch done");
+            }
+            catch (Exception ex) { Logger.Error("geometry watch failed: " + ex.Message); }
+            finally
+            {
+                Interlocked.CompareExchange(ref _cts, null, cts);
+                cts.Dispose();
+            }
+        });
+    }
+
     // ── 尺寸 ────────────────────────────────────────────────────────
 
-    private static (int W, int H) TargetSize(GeometryConfig cfg, string sizeMode, int srcW, int srcH,
-        Native.RECT screen, int minW, int minH, Native.RECT current)
+    /// <summary>
+    /// 光标旁 + 原比例最大化：一次算完「往哪边弹」和「弹多大」。
+    ///
+    /// 四个方向各自先算出从光标（严格留出 Gap 像素）到工作区边缘的可用矩形，
+    /// 再用同一个缩放系数把原始比例放进这个矩形 —— 宽高一起缩放，绝不分别夹取，
+    /// 否则宽高比一变，Seer 就会在图片两侧/上下补黑边。
+    /// 最终按「是否满足最小窗 + 预览面积 + 可用空间面积」挑最优方向。
+    /// </summary>
+    private static GeometryResult PlanAuto(Native.POINT cursor, Native.RECT work, Native.RECT screen,
+        GeometryConfig cfg, int srcW, int srcH, int minW, int minH, int cfgW, int cfgH)
+    {
+        var debug = DebugPlans ? new StringBuilder() : null;
+        bool known = srcW > 0 && srcH > 0;
+        double bw = known ? srcW : Math.Max(1, cfgW > 0 ? cfgW : minW);
+        double bh = known ? srcH : Math.Max(1, cfgH > 0 ? cfgH : minH);
+
+        double ratio = cfg.MaxScreenRatio > 0 ? cfg.MaxScreenRatio : 1.0;
+        int capW = Math.Max(200, (int)(screen.Width * ratio));
+        int capH = Math.Max(150, (int)(screen.Height * ratio));
+        int gap = Math.Max(0, cfg.Gap);
+        double floorScale = Math.Max(minW / bw, minH / bh);
+        // Seer V2 的 rect 不会放大图片：窗口比原图大时只按 1:1 居中，四周补黑边。
+        // 打开 UpscaleToFill 时允许窗口放大（HoverController 会先把图片重采样成临时大图，
+        // Seer 对大图会缩小填满，视觉上就是原比例放大）；关闭时严格不超过原图像素。
+        double screenScale = Math.Min(capW / bw, capH / bh);
+        if (!cfg.UpscaleToFill) screenScale = Math.Min(1.0, screenScale);
+
+        // (是否水平方向, 近端坐标, 远端坐标, 方向：+1 = 右/下)
+        var dirs = new (bool Horizontal, int Near, int Far, int Sign)[]
+        {
+            (true,  cursor.X + gap, work.Right,  +1),   // 右
+            (true,  work.Left,      cursor.X - gap, -1), // 左
+            (false, cursor.Y + gap, work.Bottom, +1),   // 下
+            (false, work.Top,       cursor.Y - gap, -1), // 上
+        };
+
+        bool found = false;
+        GeometryResult best = default;
+        double bestScore = double.MinValue;
+
+        foreach (var d in dirs)
+        {
+            int span = d.Far - d.Near;                              // 弹出方向上的可用长度
+            int cross = d.Horizontal ? work.Height : work.Width;    // 垂直方向整个工作区都可用
+            if (span < 60 || cross < 60) continue;
+
+            // 水平方向：span 比宽、cross 比高；垂直方向正好相反
+            double spanSide = d.Horizontal ? bw : bh;
+            double crossSide = d.Horizontal ? bh : bw;
+            double scale = Math.Min(screenScale, Math.Min(span / spanSide, cross / crossSide));
+            if (scale <= 0) continue;
+
+            int w = Math.Clamp((int)Math.Round(bw * scale), 1, capW);
+            int h = Math.Clamp((int)Math.Round(bh * scale), 1, capH);
+            if (w < 2 || h < 2) continue;
+
+            // 峰值优先：能满足 Seer 最小窗的方向 >> 预览面积大的方向 >> 剩余空间大的方向
+            double score = (scale >= floorScale ? 1e12 : 0)
+                         + (double)w * h
+                         + (double)span * cross / 1e6;
+            if (found && score <= bestScore) continue;
+
+            int left = d.Horizontal
+                ? (d.Sign > 0 ? cursor.X + gap : cursor.X - gap - w)
+                : cursor.X - w / 2;
+            int top = d.Horizontal
+                ? cursor.Y - h / 2
+                : (d.Sign > 0 ? cursor.Y + gap : cursor.Y - gap - h);
+            ClampToWork(ref left, ref top, w, h, work);
+
+            // 已经留了 gap，这里用 gap-1 做安全垫，避免「刚好贴着 28px」被判成压住鼠标又挪走
+            if (cfg.AvoidCursor)
+                NudgeAwayFromCursor(ref left, ref top, w, h, cursor, work, Math.Max(10, gap - 1));
+            ClampToWork(ref left, ref top, w, h, work);
+            debug?.AppendLine($"  h={d.Horizontal} sign={d.Sign:+0;-0} span={span} cross={cross} scale={scale:0.000} {w}x{h} score={score:0.0} at {left},{top}");
+
+            best = new GeometryResult(w, h,
+                new Native.RECT { Left = left, Top = top, Right = left + w, Bottom = top + h });
+            bestScore = score;
+            found = true;
+        }
+
+        if (debug != null)
+        {
+            debug.Insert(0, $"src={bw:0}x{bh:0} screenScale={screenScale:0.000} floorScale={floorScale:0.000}\n");
+            LastPlanDebug = debug.ToString();
+        }
+        if (found) return best;
+
+        // 工作区太小（极端缩放 / 单屏手机投影）：退回工作区左上角，保持比例不夹成黑框
+        int fw = Math.Clamp((int)Math.Round(bw), 1, capW);
+        int fh = Math.Clamp((int)Math.Round(bh), 1, capH);
+        int l0 = work.Left, t0 = work.Top;
+        ClampToWork(ref l0, ref t0, fw, fh, work);
+        return new GeometryResult(fw, fh,
+            new Native.RECT { Left = l0, Top = t0, Right = l0 + fw, Bottom = t0 + fh });
+    }
+
+    private static (int W, int H) TargetSize(GeometryConfig cfg, string sizeMode, int cfgW, int cfgH,
+        int srcW, int srcH, Native.RECT screen, int minW, int minH, Native.RECT current)
     {
         if (sizeMode == "seer")
             return (current.Width, current.Height);
@@ -225,20 +470,30 @@ internal sealed class GeometryController
             double scale = Math.Min(avail, Math.Max(Math.Min(1.0, avail), floorS));
             int w = (int)Math.Round(srcW * scale);
             int h = (int)Math.Round(srcH * scale);
-            int cw = Math.Clamp(w, Math.Min(minW, maxW), maxW);
-            int ch = Math.Clamp(h, Math.Min(minH, maxH), maxH);
-            return (cw, ch);
+            // 必须整体等比放大到最小窗；分别夹取宽高会把比例夹歪，Seer 就补黑边
+            if ((w < minW || h < minH) && w > 0 && h > 0)
+            {
+                double up = Math.Max((double)minW / w, (double)minH / h);
+                if (w * up <= maxW && h * up <= maxH)
+                {
+                    w = (int)Math.Round(w * up);
+                    h = (int)Math.Round(h * up);
+                }
+            }
+            return (Math.Clamp(w, 1, maxW), Math.Clamp(h, 1, maxH));
         }
 
         // 固定尺寸：只受「屏幕尺寸」和 8K 上限约束，不再被占屏比压小，
         // 这样 4K 屏可以把高度直接设成 2160（铺满整屏）。
+        // 下限 320x240（音频等类别想要小窗预览）；Seer 若坚持自己的最小窗会夹回，
+        // 盯梢逻辑会把被夹大的值当作实际值采纳，不会抖动。
         int capW = Math.Max(minW, Math.Min(scrW, MaxFixedW));
         int capH = Math.Max(minH, Math.Min(scrH, MaxFixedH));
 
-        int fw = cfg.Width > 0 ? cfg.Width : current.Width;
-        int fh = cfg.Height > 0 ? cfg.Height : current.Height;
-        fw = Math.Clamp(fw, Math.Min(minW, capW), capW);
-        fh = Math.Clamp(fh, Math.Min(minH, capH), capH);
+        int fw = cfgW > 0 ? cfgW : current.Width;
+        int fh = cfgH > 0 ? cfgH : current.Height;
+        fw = Math.Clamp(fw, Math.Min(MinFixedW, capW), capW);
+        fh = Math.Clamp(fh, Math.Min(MinFixedH, capH), capH);
         return (fw, fh);
     }
 

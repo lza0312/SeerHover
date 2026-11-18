@@ -99,30 +99,48 @@ internal sealed class SeerV2 : IDisposable
     }
 
     /// <summary>
-    /// 以 main 模式打开预览。显式传 rect 会关闭 SDK 的 content-fit 自动缩放。
+    /// 以 main 模式打开预览。显式传 rect 会关闭 SDK 的 content-fit 自动缩放；
+    /// rect 传 null 则完全按 Seer 自己的尺寸显示（媒体控件场景用）。
     /// noop=true 用 ifAlreadyOpen:"noop"（已打开则复用），false 用 "toggle"。
+    /// focus=true 让 Seer 激活并聚焦预览窗（默认不抢焦点）。
+    /// -32001 NOT_ACTIVE 时稍候重试一次（Seer 的 active 偶尔瞬时不稳），其它错误直接失败。
     /// </summary>
-    public bool PreviewOpen(string path, Native.RECT rect, bool noop = true)
+    public bool PreviewOpen(string path, Native.RECT? rect = null, bool noop = true, bool focus = false)
     {
         var p = new Dictionary<string, object?>
         {
             ["path"] = path,
             ["mode"] = "main",
             ["ifAlreadyOpen"] = noop ? "noop" : "toggle",
-            ["rect"] = ClampRect(rect),
         };
+        if (rect.HasValue) p["rect"] = ClampRect(rect.Value);
+        if (focus) p["focus"] = true;
 
-        using var doc = Call("seer.preview.open", p, out int err);
-        if (doc == null || err != 0) return false;
+        bool Parse(JsonDocument? doc)
+        {
+            if (doc == null) return false;
+            JsonElement root = doc.RootElement;
+            if (!root.TryGetProperty("result", out JsonElement r) || r.ValueKind != JsonValueKind.Object)
+                return false;
+            // 成功结果是 {"sessionId": ...}（实测 4.8.10：带 rect + noop 时返回 sessionId，
+            // 且随后 getState 的 rect 精确等于请求值、loadState=content）。
+            // toggle 把已有预览关掉时是 {"closed":true}，没有 sessionId → 视作「未打开」。
+            return r.TryGetProperty("sessionId", out JsonElement sid) && sid.ValueKind != JsonValueKind.Null;
+        }
 
-        JsonElement root = doc.RootElement;
-        if (!root.TryGetProperty("result", out JsonElement r) || r.ValueKind != JsonValueKind.Object)
-            return false;
+        int err1;
+        using (var doc = Call("seer.preview.open", p, out err1))
+        {
+            if (err1 == 0 && Parse(doc)) return true;
+        }
 
-        // 成功结果是 {"sessionId": ...}（实测 4.8.10：带 rect + noop 时返回 sessionId，
-        // 且随后 getState 的 rect 精确等于请求值、loadState=content）。
-        // toggle 把已有预览关掉时是 {"closed":true}，没有 sessionId → 视作「未打开」。
-        return r.TryGetProperty("sessionId", out JsonElement sid) && sid.ValueKind != JsonValueKind.Null;
+        // 只对 -32001 NOT_ACTIVE 重试：Seer 的 active 偶尔瞬时不稳；其它错误（路径无效等）直接失败
+        if (err1 != -32001) return false;
+        Thread.Sleep(150);
+        using (var doc = Call("seer.preview.open", p, out int err2))
+        {
+            return err2 == 0 && Parse(doc);
+        }
     }
 
     public bool PreviewClose()
@@ -162,6 +180,45 @@ internal sealed class SeerV2 : IDisposable
         var p = new Dictionary<string, object?> { ["rect"] = ClampRect(rect) };
         using var doc = Call("seer.window.setBounds", p, out int err);
         return doc != null && err == 0;
+    }
+
+    /// <summary>
+    /// 列出当前预览的可用控件（按钮 / 滑杆等）。4.8.10+ 提供，
+    /// 媒体预览里应包含播放 / 进度 / 静音等控件。原始 JSON 直接返回，便于探查。
+    /// </summary>
+    public string? PreviewListControls()
+    {
+        using var doc = Call("seer.preview.listControls", null, out int err);
+        return doc == null || err != 0
+            ? $"ERR {err}: {_lastError}"
+            : doc.RootElement.TryGetProperty("result", out var r) ? r.GetRawText() : doc.RootElement.GetRawText();
+    }
+
+    /// <summary>触发当前预览的某个控件（id 来自 PreviewListControls）。extra 可带参数。</summary>
+    public bool PreviewTriggerControl(string controlId, Dictionary<string, object?>? extra = null)
+    {
+        var p = new Dictionary<string, object?> { ["id"] = controlId };
+        if (extra != null)
+            foreach (var kv in extra) p[kv.Key] = kv.Value;
+        using var doc = Call("seer.preview.triggerControl", p, out int err);
+        return doc != null && err == 0;
+    }
+
+    /// <summary>当前预览的属性（媒体预览可能带时长 / 进度 / 音量等）。</summary>
+    public string? PreviewGetProperties()
+    {
+        using var doc = Call("seer.preview.getProperties", null, out int err);
+        return doc == null || err != 0
+            ? $"ERR {err}: {_lastError}"
+            : doc.RootElement.TryGetProperty("result", out var r) ? r.GetRawText() : doc.RootElement.GetRawText();
+    }
+
+    /// <summary>诊断用：调用任意 RPC 方法并返回原始 result JSON。</summary>
+    public string? RpcRaw(string method, Dictionary<string, object?>? @params)
+    {
+        using var doc = Call(method, @params, out int err);
+        if (doc == null || err != 0) return $"ERR {err}: {_lastError}";
+        return doc.RootElement.TryGetProperty("result", out var r) ? r.GetRawText() : doc.RootElement.GetRawText();
     }
 
     public void Dispose()

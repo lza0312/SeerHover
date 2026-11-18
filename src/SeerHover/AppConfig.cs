@@ -33,6 +33,24 @@ internal sealed class GeometryConfig
 
     /// <summary>窗口最多占屏幕比例（0.1 - 1.0）</summary>
     public double MaxScreenRatio { get; set; } = 0.9;
+
+    /// <summary>
+    /// 原比例最大化时允许放大超过原图像素：先把图片高质量重采样成临时副本再交给 Seer。
+    /// Seer 带 rect 不会放大图片，只会对「比窗口大的图」缩小填满，所以放大必须靠副本。
+    /// </summary>
+    public bool UpscaleToFill { get; set; } = true;
+
+    /// <summary>
+    /// 按媒体类别覆盖尺寸策略。key 见 <see cref="MediaKind"/>（image/video/audio/web/text/archive/document/other），
+    /// 值为 auto（原比例最大化）/ seer（跟随 Seer）/ fixed（用配置宽高）；缺失或空 = 用全局 SizeMode。
+    /// </summary>
+    public Dictionary<string, string>? CategoryModes { get; set; }
+
+    /// <summary>
+    /// 按类别覆盖「固定尺寸」的宽高（key 同 CategoryModes，值 [宽, 高] 物理像素）。
+    /// 仅当该类别（或全局）尺寸策略为 fixed 时生效；缺失 = 用全局 Geometry.Width / Height。
+    /// </summary>
+    public Dictionary<string, int[]>? CategorySizes { get; set; }
 }
 
 internal sealed class AppConfig
@@ -53,6 +71,12 @@ internal sealed class AppConfig
 
     /// <summary>目录项是否触发预览</summary>
     public bool PreviewFolders { get; set; } = false;
+
+    /// <summary>媒体控件条初始音量（0-100，只作用于 Seer 的会话音量）</summary>
+    public int MediaVolume { get; set; } = 100;
+
+    /// <summary>媒体控件条初始倍速（0.2-6.0，按 0.2 步进，与 Seer 的 X/C 键一致）</summary>
+    public double MediaRate { get; set; } = 1.0;
 
     /// <summary>按住 Ctrl/Shift/Alt 时不触发（避免干扰多选）</summary>
     public bool SuppressOnModifiers { get; set; } = true;
@@ -186,6 +210,8 @@ internal sealed class AppConfig
         PollMs = src.PollMs;
         MinInvokeIntervalMs = src.MinInvokeIntervalMs;
         PreviewFolders = src.PreviewFolders;
+        MediaVolume = src.MediaVolume;
+        MediaRate = src.MediaRate;
         SuppressOnModifiers = src.SuppressOnModifiers;
         ExcludeExtensions = new List<string>(src.ExcludeExtensions ?? new List<string>());
         ExcludePaths = new List<string>(src.ExcludePaths ?? new List<string>());
@@ -212,7 +238,14 @@ internal sealed class AppConfig
             Y = g.Y,
             Corner = g.Corner,
             Margin = g.Margin,
-            MaxScreenRatio = g.MaxScreenRatio
+            MaxScreenRatio = g.MaxScreenRatio,
+            UpscaleToFill = g.UpscaleToFill,
+            CategoryModes = g.CategoryModes == null
+                ? null
+                : new Dictionary<string, string>(g.CategoryModes, StringComparer.OrdinalIgnoreCase),
+            CategorySizes = g.CategorySizes == null
+                ? null
+                : new Dictionary<string, int[]>(g.CategorySizes, StringComparer.OrdinalIgnoreCase)
         };
 
         _extSet = null;
@@ -229,6 +262,9 @@ internal sealed class AppConfig
         // 界面缩放：80% 以下字太小、160% 以上设置窗口在 1080p 上塞不下
         if (UiScale < 80) UiScale = 80;
         if (UiScale > 160) UiScale = 160;
+        if (MediaVolume < 0) MediaVolume = 0;
+        if (MediaVolume > 100) MediaVolume = 100;
+        MediaRate = Math.Clamp(Math.Round(MediaRate * 5) / 5.0, 0.2, 6.0);
         if (SettingsWidth < 0) SettingsWidth = 0;
         if (SettingsHeight < 0) SettingsHeight = 0;
         if (SettingsWidth > 0 && SettingsWidth < 700) SettingsWidth = 0;
@@ -255,22 +291,48 @@ internal sealed class AppConfig
             _ => "cursor"
         };
 
-        // Seer 有最小窗口尺寸（150% 缩放下 765x645），比它小的设置会被立刻夹回，
-        // 反复设置就会产生「越设越小、然后被弹回」的抖动。这里直接抬到可用值。
-        if (Geometry.Height > 0 && Geometry.Height < 645)
+        // 固定尺寸下限放宽到 320x240：音频等类别想要小窗预览。
+        // Seer 若坚持自己的最小窗（150% 缩放下 765x645）会自动夹回，盯梢逻辑会采纳实际值。
+        if (Geometry.Height > 0 && Geometry.Height < 240)
         {
-            Logger.Info($"config Height={Geometry.Height} 小于 Seer 最小窗口高度，已提升为 700");
-            Geometry.Height = 700;
+            Logger.Info($"config Height={Geometry.Height} 小于下限，已提升为 240");
+            Geometry.Height = 240;
         }
-        if (Geometry.Width > 0 && Geometry.Width < 765)
+        if (Geometry.Width > 0 && Geometry.Width < 320)
         {
-            Logger.Info($"config Width={Geometry.Width} 小于 Seer 最小窗口宽度，已提升为 900");
-            Geometry.Width = 900;
+            Logger.Info($"config Width={Geometry.Width} 小于下限，已提升为 320");
+            Geometry.Width = 320;
         }
 
         // 上限 8K（7680x4320），足够 4K / 5K2K 带鱼屏；再大没有意义，还会让 Seer 摆到屏幕外
         if (Geometry.Width > 7680) Geometry.Width = 7680;
         if (Geometry.Height > 4320) Geometry.Height = 4320;
+
+        // 按类别的尺寸覆盖：只认 auto / seer / fixed，空值和未知 key 直接丢掉（等价于跟随全局）
+        if (Geometry.CategoryModes != null)
+        {
+            var cleaned = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in Geometry.CategoryModes)
+            {
+                string mode = (v ?? string.Empty).Trim().ToLowerInvariant();
+                if (mode is "auto" or "seer" or "fixed") cleaned[k.Trim().ToLowerInvariant()] = mode;
+            }
+            Geometry.CategoryModes = cleaned.Count > 0 ? cleaned : null;
+        }
+
+        // 按类别的固定宽高：宽高夹到 320x240 ~ 8K（下限放宽，小窗预览用）；无效条目丢弃
+        if (Geometry.CategorySizes != null)
+        {
+            var cleanedSizes = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in Geometry.CategorySizes)
+            {
+                if (v == null || v.Length != 2) continue;
+                int w = Math.Clamp(v[0], 320, 7680);
+                int h = Math.Clamp(v[1], 240, 4320);
+                cleanedSizes[k.Trim().ToLowerInvariant()] = new[] { w, h };
+            }
+            Geometry.CategorySizes = cleanedSizes.Count > 0 ? cleanedSizes : null;
+        }
 
         _extSet = null;   // 排除列表变了，集合缓存作废
         return this;

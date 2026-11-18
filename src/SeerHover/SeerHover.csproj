@@ -10,8 +10,10 @@
     <AssemblyName>SeerHover</AssemblyName>
     <RootNamespace>SeerHover</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\SeerHover.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- 版本号可由 tools/build.ps1 -Version 或 CI 的 -p:SeerHoverVersion= 注入，缺省 1.0.0 -->
     <SeerHoverVersion Condition="'$(SeerHoverVersion)' == ''">1.0.0</SeerHoverVersion>
     <Version>$(SeerHoverVersion)</Version>
@@ -22,5 +24,10 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <TieredPGO>true</TieredPGO>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 单文件发布时外部资源不存在，托盘/窗口图标从程序集里读 -->
+    <EmbeddedResource Include="..\..\assets\SeerHover.ico" LogicalName="SeerHover.AppIcon" />
+  </ItemGroup>
 
 </Project>

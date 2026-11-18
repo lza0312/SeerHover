@@ -21,6 +21,7 @@ internal static class Native
 
     public const int WH_MOUSE_LL = 14;
     public const int WM_LBUTTONDOWN = 0x0201;
+    public const int WM_MOUSEWHEEL = 0x020A;
     public const uint WM_QUIT = 0x0012;
     public const int SM_CXDOUBLECLK = 36;
     public const int SM_CYDOUBLECLK = 37;
@@ -130,6 +131,12 @@ internal static class Native
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern short VkKeyScanW(char ch);
+
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string? cls, string? title);
@@ -412,6 +419,26 @@ internal static class Native
         return IntPtr.Zero;
     }
 
+    /// <summary>在窗口子树里按类名找【所有】匹配句柄（多标签页时会有多个 DefView）。</summary>
+    public static List<IntPtr> FindAllClass(IntPtr parent, int depth, string cls)
+    {
+        var found = new List<IntPtr>();
+        FindAllClassCore(parent, depth, cls, found);
+        return found;
+    }
+
+    private static void FindAllClassCore(IntPtr parent, int depth, string cls, List<IntPtr> found)
+    {
+        if (parent == IntPtr.Zero || depth <= 0) return;
+        IntPtr child = IntPtr.Zero;
+        while ((child = FindWindowExW(parent, child, null, null)) != IntPtr.Zero)
+        {
+            var c = ClassOf(child);
+            if (string.Equals(c, cls, StringComparison.OrdinalIgnoreCase)) found.Add(child);
+            FindAllClassCore(child, depth - 1, cls, found);
+        }
+    }
+
     /// <summary>
     /// 资源管理器文件列表（图标/详细信息那块）的窗口句柄。
     /// Win10：CabinetWClass → SHELLDLL_DefView → DirectUIHWND；
@@ -420,26 +447,38 @@ internal static class Native
     /// 两种结构里 SHELLDLL_DefView 的矩形都正好是「文件区」（不含导航窗格、地址栏、状态栏），
     /// 所以直接找它；找不到就返回 0（宁可不开这个功能，也不要把导航窗格当成空白处）。
     /// </summary>
-    private static readonly Dictionary<IntPtr, (IntPtr View, long At)> ViewCache = new();
+    private static readonly Dictionary<long, (IntPtr View, long At)> ViewCache = new();
     private static readonly object ViewSync = new();
 
-    public static IntPtr ItemsViewOf(IntPtr explorerRoot)
+    public static IntPtr ItemsViewOf(IntPtr explorerRoot, int tabIndex = 0)
     {
         if (explorerRoot == IntPtr.Zero) return IntPtr.Zero;
 
+        // 缓存 key 带上标签序号：切换标签时拿到的是不同 DefView
+        long key = ((long)explorerRoot << 8) | (uint)Math.Clamp(tabIndex, 0, 255);
         long now = Environment.TickCount64;
         lock (ViewSync)
         {
-            if (ViewCache.TryGetValue(explorerRoot, out var hit) && now - hit.At < 10_000 && IsWindow(hit.View))
+            if (ViewCache.TryGetValue(key, out var hit) && now - hit.At < 10_000 && IsWindow(hit.View))
                 return hit.View;
         }
 
-        // 窗口结构（多标签页切换）可能变，缓存过期或句柄失效就重新找
-        IntPtr view = FindChildClass(explorerRoot, 6, "SHELLDLL_DefView");
+        // 多标签页下有多个 SHELLDLL_DefView，按序号取对应那个（0 = 兼容单标签的老行为）
+        IntPtr view;
+        if (tabIndex <= 0)
+        {
+            view = FindChildClass(explorerRoot, 6, "SHELLDLL_DefView");
+        }
+        else
+        {
+            var all = FindAllClass(explorerRoot, 8, "SHELLDLL_DefView");
+            view = tabIndex < all.Count ? all[tabIndex] : IntPtr.Zero;
+            if (view == IntPtr.Zero && all.Count > 0) view = all[0];
+        }
         lock (ViewSync)
         {
-            if (ViewCache.Count > 32) ViewCache.Clear();
-            ViewCache[explorerRoot] = (view, now);
+            if (ViewCache.Count > 64) ViewCache.Clear();
+            ViewCache[key] = (view, now);
         }
         return view;
     }

@@ -17,6 +17,7 @@ internal sealed class TrayHost : ApplicationContext
     private readonly ToolStripMenuItem _statusItem;
     private readonly Control _invoker;
     private SettingsForm? _settings;
+    private MediaOverlayForm? _mediaOverlay;
 
     public TrayHost(AppConfig cfg, bool openSettings = false)
     {
@@ -25,6 +26,10 @@ internal sealed class TrayHost : ApplicationContext
         _controller = new HoverController(cfg, _ipc, _v2);
         _controller.StateChanged += OnStateChanged;
         _controller.PreviewMismatch += OnPreviewMismatch;
+
+        // 音/视频预览右下角的媒体控制条（音量滑块 + 倍速）。自轮询 Seer 状态，预览不在就不显示。
+        _mediaOverlay = new MediaOverlayForm(_v2, _cfg.MediaVolume, _cfg.MediaRate);
+        _mediaOverlay.Show();
 
         // 资源管理器空白处双击 = 回到上一层（开关在设置里，实时读取配置；钩子常驻，代价可忽略）
         _explorerUp = new ExplorerUp(() => _cfg.DoubleClickUp);
@@ -42,6 +47,8 @@ internal sealed class TrayHost : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_toggleItem);
         menu.Items.Add(new ToolStripMenuItem("重载配置", null, (_, _) => ReloadConfig()));
+        var bgItem = new ToolStripMenuItem("图片背景切下一档（B）", null, (_, _) => CycleImageBackground());
+        menu.Items.Add(bgItem);
         menu.Items.Add(new ToolStripMenuItem("打开日志", null, (_, _) => OpenLog()));
         menu.Items.Add(new ToolStripMenuItem("打开崩溃日志", null, (_, _) => OpenCrashLog()));
         menu.Items.Add(new ToolStripSeparator());
@@ -49,11 +56,16 @@ internal sealed class TrayHost : ApplicationContext
 
         // 菜单配色跟随设置里的深色模式（每次弹出前重新套一遍，切换后无需重启）
         MenuTheme.Apply(menu);
-        menu.Opening += (_, _) => MenuTheme.Apply(menu);
+        menu.Opening += (_, _) =>
+        {
+            MenuTheme.Apply(menu);
+            // 背景切换只对可见的图片预览有意义（Seer 的 B 键循环：棋盘格/黑/白/灰/透明）
+            bgItem.Enabled = _ipc.IsRunning && _ipc.IsVisibleFast;
+        };
 
         _tray = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = Program.AppIcon(16),
             Text = "SeerHover - 悬停预览",
             Visible = true,
             ContextMenuStrip = menu
@@ -98,6 +110,8 @@ internal sealed class TrayHost : ApplicationContext
             }
             try { EnsureStartupLinkTarget(); }
             catch (Exception ex) { Logger.Error("startup link check: " + ex.Message); }
+            try { PreviewUpscaler.Cleanup(); }
+            catch (Exception ex) { Logger.Error("preview cache cleanup: " + ex.Message); }
         });
 
         if (openSettings)
@@ -122,7 +136,7 @@ internal sealed class TrayHost : ApplicationContext
         {
             t.Stop();
             t.Dispose();
-            _tray.ShowBalloonTip(9000, "SeerHover",
+            TrayBalloon.Show(_tray, 9000, "SeerHover",
                 "检测到上次异常退出。崩溃记录已保存，可在托盘菜单「打开崩溃日志」查看。",
                 ToolTipIcon.Warning);
         };
@@ -171,7 +185,7 @@ internal sealed class TrayHost : ApplicationContext
         catch (Exception ex)
         {
             Logger.Error("open settings failed: " + ex.Message);
-            _tray.ShowBalloonTip(4000, "SeerHover", "打开设置窗口失败：" + ex.Message, ToolTipIcon.Error);
+            TrayBalloon.Show(_tray, 4000, "SeerHover", "打开设置窗口失败：" + ex.Message, ToolTipIcon.Error);
         }
     }
 
@@ -184,17 +198,18 @@ internal sealed class TrayHost : ApplicationContext
         Logger.EnableVerbose(_cfg.VerboseLog);
         _controller.ForceHide();
         _controller.Restart();
+        _mediaOverlay?.SetDefaults(_cfg.MediaVolume, _cfg.MediaRate);
         _toggleItem.Text = _controller.Paused ? "恢复悬停预览" : "暂停悬停预览";
         Logger.Info(quiet ? "settings applied (stay open)" : "settings applied");
 
         if (!saved)
         {
             Logger.Error("settings apply: config.json write failed");
-            _tray.ShowBalloonTip(6000, "SeerHover",
+            TrayBalloon.Show(_tray, 6000, "SeerHover",
                 "设置已生效，但 config.json 写入失败，重启后会丢失。", ToolTipIcon.Error);
             return false;
         }
-        if (!quiet) _tray.ShowBalloonTip(1500, "SeerHover", "设置已保存并生效。", ToolTipIcon.Info);
+        if (!quiet) TrayBalloon.Show(_tray, 1500, "SeerHover", "设置已保存并生效。", ToolTipIcon.Info);
         return true;
     }
 
@@ -271,7 +286,7 @@ internal sealed class TrayHost : ApplicationContext
         if (enabled)
         {
             if (manual)
-                Post(() => _tray.ShowBalloonTip(2500, "SeerHover", "Seer 已开启「保持窗口大小位置」，预览尺寸不会跳。", ToolTipIcon.Info));
+                Post(() => TrayBalloon.Show(_tray, 2500, "SeerHover", "Seer 已开启「保持窗口大小位置」，预览尺寸不会跳。", ToolTipIcon.Info));
             return "Seer 已开启「保持窗口大小位置」，预览尺寸不会跳。";
         }
 
@@ -284,7 +299,7 @@ internal sealed class TrayHost : ApplicationContext
         if (manual || changed.Count == 0)
         {
             var icon = changed.Count > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning;
-            Post(() => _tray.ShowBalloonTip(9000, "SeerHover", msg, icon));
+            Post(() => TrayBalloon.Show(_tray, 9000, "SeerHover", msg, icon));
         }
         return msg;
     }
@@ -302,7 +317,7 @@ internal sealed class TrayHost : ApplicationContext
         bool liveOn = v2Tracking ?? (_ipc.IsRunning && _ipc.IsTrackingEnabled);
         if (!iniOn && !liveOn)
         {
-            if (manual) Post(() => _tray.ShowBalloonTip(2000, "SeerHover", "Seer「跟随选中项」已关闭，无需处理。", ToolTipIcon.Info));
+            if (manual) Post(() => TrayBalloon.Show(_tray, 2000, "SeerHover", "Seer「跟随选中项」已关闭，无需处理。", ToolTipIcon.Info));
             return "Seer「跟随选中项」已关闭，无需处理。";
         }
 
@@ -316,7 +331,7 @@ internal sealed class TrayHost : ApplicationContext
         {
             var icon = changed.Count > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning;
             string title = fromMismatch ? "预览文件不一致" : "SeerHover";
-            Post(() => _tray.ShowBalloonTip(8000, title, msg, icon));
+            Post(() => TrayBalloon.Show(_tray, 8000, title, msg, icon));
         }
         return msg;
     }
@@ -362,7 +377,33 @@ internal sealed class TrayHost : ApplicationContext
         ApplyTheme();
         Logger.EnableVerbose(_cfg.VerboseLog);
         _controller.Restart();
-        _tray.ShowBalloonTip(1500, "SeerHover", "配置已重载", ToolTipIcon.Info);
+        TrayBalloon.Show(_tray, 1500, "SeerHover", "配置已重载", ToolTipIcon.Info);
+    }
+
+    /// <summary>
+    /// 给当前可见的预览窗发一次 B 键：Seer 用它循环图片背景（棋盘格/黑/白/灰/透明），
+    /// 选中的档位在本次 Seer 运行内会一直记住。透明图层想直接显示成透明就用它。
+    /// </summary>
+    private void CycleImageBackground()
+    {
+        try
+        {
+            IntPtr w = _ipc.Window;
+            if (w == IntPtr.Zero || !Native.IsWindowVisible(w))
+            {
+                TrayBalloon.Show(_tray, 2500, "SeerHover", "先悬停弹出一个图片预览，再点这项切换背景。", ToolTipIcon.Info);
+                return;
+            }
+            Native.SetForegroundWindow(w);
+            Thread.Sleep(80);
+            Native.keybd_event(0x42, 0, 0, UIntPtr.Zero);              // B
+            Native.keybd_event(0x42, 0, Native.KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Logger.Info("image background cycled (B)");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("cycle image background: " + ex.Message);
+        }
     }
 
     private void OpenConfig()
@@ -420,7 +461,7 @@ internal sealed class TrayHost : ApplicationContext
     private static bool IsStartupEnabled()
     {
         try { return File.Exists(StartupLink); }
-        catch { return false; }
+        catch (Exception ex) { Console.Out.WriteLine("TrayBalloon EnsureAdded ERR: " + ex.Message); return false; }
     }
 
     /// <summary>启动时校验快捷方式目标；不一致就重建，并提示一次。必须在 UI 线程写 COM。</summary>
@@ -442,7 +483,7 @@ internal sealed class TrayHost : ApplicationContext
         Post(() =>
         {
             SetStartup(true);
-            _tray.ShowBalloonTip(6000, "SeerHover",
+            TrayBalloon.Show(_tray, 6000, "SeerHover",
                 "检测到程序位置变化，已自动修复开机自启快捷方式。", ToolTipIcon.Info);
         });
     }
@@ -477,7 +518,7 @@ internal sealed class TrayHost : ApplicationContext
         catch (Exception ex)
         {
             Logger.Error("startup toggle failed: " + ex.Message);
-            _tray.ShowBalloonTip(4000, "SeerHover", "修改开机自启失败：" + ex.Message, ToolTipIcon.Error);
+            TrayBalloon.Show(_tray, 4000, "SeerHover", "修改开机自启失败：" + ex.Message, ToolTipIcon.Error);
         }
     }
 
@@ -487,6 +528,8 @@ internal sealed class TrayHost : ApplicationContext
         _controller.Stop();
         _controller.Dispose();
         _explorerUp.Dispose();
+        _mediaOverlay?.Dispose();
+        _mediaOverlay = null;
         _ipc.Dispose();
         _v2.Dispose();
         if (_settings != null && !_settings.IsDisposed) _settings.Close();
@@ -508,4 +551,15 @@ internal sealed class TrayHost : ApplicationContext
         }
         base.Dispose(disposing);
     }
+}
+
+/// <summary>
+/// 气泡通知统一入口。曾尝试原生 NIF_INFO + NIIF_USER 自定义图标：
+/// Shell_NotifyIcon 全部返回成功但 Win11 不渲染 toast（换隐藏图标/可见图标/版本 0/4、加延迟都一样），
+/// 而 WinForms 的 ShowBalloonTip 在本机实测图标渲染正常（应用图标 + 系统信息图标都有），故直接转发。
+/// </summary>
+internal static class TrayBalloon
+{
+    public static void Show(NotifyIcon tray, int timeoutMs, string title, string msg, ToolTipIcon kind)
+        => tray.ShowBalloonTip(Math.Max(timeoutMs, 4000), title, msg, kind);
 }
