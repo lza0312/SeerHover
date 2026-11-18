@@ -9,6 +9,7 @@ internal sealed class TrayHost : ApplicationContext
 {
     private readonly AppConfig _cfg;
     private readonly SeerIpc _ipc = new();
+    private readonly SeerV2 _v2 = new();
     private readonly HoverController _controller;
     private readonly ExplorerUp _explorerUp;
     private readonly NotifyIcon _tray;
@@ -21,7 +22,7 @@ internal sealed class TrayHost : ApplicationContext
     {
         _cfg = cfg;
         ApplyTheme();
-        _controller = new HoverController(cfg, _ipc);
+        _controller = new HoverController(cfg, _ipc, _v2);
         _controller.StateChanged += OnStateChanged;
         _controller.PreviewMismatch += OnPreviewMismatch;
 
@@ -71,10 +72,30 @@ internal sealed class TrayHost : ApplicationContext
         // Seer 配置检查放后台：即使 Seer 卡住（IPC 超时）也不拖慢托盘出现
         _ = Task.Run(() =>
         {
+            try
+            {
+                if (_v2.EnsureConnected())
+                {
+                    var info = _v2.GetInfo();
+                    Logger.Info($"v2 pipe ready: app={info?.AppVersion} licensed={info?.Licensed}");
+                }
+                else Logger.Info("v2 pipe unavailable: " + _v2.LastError);
+            }
+            catch (Exception ex) { Logger.Error("v2 probe: " + ex.Message); }
             try { FixTracking(manual: false); }
             catch (Exception ex) { Logger.Error("startup tracking check: " + ex.Message); }
-            try { EnsureKeepWindow(manual: false); }
-            catch (Exception ex) { Logger.Error("startup keep-window check: " + ex.Message); }
+            // V2 可用时 preview.open 带 rect 已禁用 content-fit，不再需要改 Seer 的
+            // keep_wnd_sz_pos_mode（那是全局设置，会影响空格预览，不要擅自改）。
+            // 仅 V2 不可用时（旧版 Seer）才回退到改 ini 的老办法。
+            if (!_v2.IsAvailable)
+            {
+                try { EnsureKeepWindow(manual: false); }
+                catch (Exception ex) { Logger.Error("startup keep-window check: " + ex.Message); }
+            }
+            else
+            {
+                Logger.Info("v2 active: skip keep_wnd_sz_pos_mode patch (rect handles sizing)");
+            }
             try { EnsureStartupLinkTarget(); }
             catch (Exception ex) { Logger.Error("startup link check: " + ex.Message); }
         });
@@ -275,7 +296,10 @@ internal sealed class TrayHost : ApplicationContext
         foreach (var f in SeerSettings.CandidateFiles())
             if (SeerSettings.ReadTracking(f) == true) iniOn = true;
 
-        bool liveOn = _ipc.IsRunning && _ipc.IsTrackingEnabled;
+        // V2 的 tracking 是 Seer 内存里的权威状态；新版 config.ini 改完必须重启才生效，
+        // 所以要以它为准，不能只看文件（文件改了但没重启 = 仍然开着）。
+        bool? v2Tracking = _v2.IsAvailable ? _v2.IsTracking() : null;
+        bool liveOn = v2Tracking ?? (_ipc.IsRunning && _ipc.IsTrackingEnabled);
         if (!iniOn && !liveOn)
         {
             if (manual) Post(() => _tray.ShowBalloonTip(2000, "SeerHover", "Seer「跟随选中项」已关闭，无需处理。", ToolTipIcon.Info));
@@ -283,10 +307,11 @@ internal sealed class TrayHost : ApplicationContext
         }
 
         var changed = SeerSettings.DisableTracking();
+        // 新版 V2 无 RPC 可写 tracking，只能改 ini + 提示重启
         string msg = changed.Count > 0
             ? "已关闭 Seer 的「跟随选中项」。请重启 Seer 后生效（否则预览仍会跳回选中项）。"
             : "Seer 仍开着「跟随选中项」，但配置写不进去。请在 Seer 设置里手动取消勾选 Track selected file in Explorer。";
-        Logger.Info("fix tracking: changed=" + changed.Count + " liveOn=" + liveOn);
+        Logger.Info($"fix tracking: changed={changed.Count} iniOn={iniOn} liveOn={liveOn} v2={v2Tracking}");
         if (manual || fromMismatch || changed.Count == 0)
         {
             var icon = changed.Count > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning;
@@ -463,6 +488,7 @@ internal sealed class TrayHost : ApplicationContext
         _controller.Dispose();
         _explorerUp.Dispose();
         _ipc.Dispose();
+        _v2.Dispose();
         if (_settings != null && !_settings.IsDisposed) _settings.Close();
         _tray.Visible = false;
         _tray.Dispose();
@@ -476,6 +502,7 @@ internal sealed class TrayHost : ApplicationContext
             _settings?.Dispose();
             _controller?.Dispose();
             _explorerUp?.Dispose();
+            _v2?.Dispose();
             _tray?.Dispose();
             _invoker?.Dispose();
         }

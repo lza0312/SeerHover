@@ -6,6 +6,7 @@ internal sealed class HoverController : IDisposable
     private readonly AppConfig _cfg;
     private readonly HoverResolver _resolver;
     private readonly SeerIpc _ipc;
+    private readonly SeerV2? _v2;
     private readonly GeometryController _geometry;
     private readonly System.Threading.Timer _timer;
 
@@ -32,10 +33,11 @@ internal sealed class HoverController : IDisposable
     public event Action<string>? StateChanged;
     public event Action<string>? PreviewMismatch;
 
-    public HoverController(AppConfig cfg, SeerIpc ipc)
+    public HoverController(AppConfig cfg, SeerIpc ipc, SeerV2? v2 = null)
     {
         _cfg = cfg;
         _ipc = ipc;
+        _v2 = v2;
         _resolver = new HoverResolver(cfg);
         _geometry = new GeometryController(cfg, ipc);
         _timer = new System.Threading.Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
@@ -221,13 +223,29 @@ internal sealed class HoverController : IDisposable
 
     private void DoInvoke(HoverTarget target, Native.POINT cursor)
     {
-        _ipc.Invoke(target.Path);
+        // V2 优先：rect 必须和路径一起发给 Seer，才能禁掉它的 content-fit 自动缩放
+        // （否则图片会先铺成原始尺寸再被我们缩回，肉眼可见跳动）。
+        // 算 rect 需要先探源尺寸，可能几十毫秒，放在 timer 线程里不影响 UI。
+        bool openedViaV2 = false;
+        if (_v2 != null && _v2.IsAvailable)
+        {
+            var rect = _geometry.Plan(target, cursor);
+            if (rect.HasValue && !rect.Value.IsEmpty)
+                openedViaV2 = _v2.PreviewOpen(target.Path, rect.Value);
+        }
+
+        if (!openedViaV2)
+        {
+            // 回退：老版 Seer / V2 不可用时，仍走 5000 + SetWindowPos 纠偏
+            _ipc.Invoke(target.Path);
+            _geometry.Apply(target, cursor);
+        }
+
         _lastInvoke = Environment.TickCount64;
         _activePath = target.Path;
         _offSince = 0;
-        if (Logger.IsVerbose) Logger.Info($"invoke: {target.Path} (dwell {_cfg.DwellMs}ms)");
+        if (Logger.IsVerbose) Logger.Info($"invoke: {target.Path} (dwell {_cfg.DwellMs}ms, v2={openedViaV2})");
         Raise(target.Path);
-        _geometry.Apply(target, cursor);
         VerifyLater(target.Path);
     }
 

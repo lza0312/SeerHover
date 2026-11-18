@@ -211,6 +211,29 @@ internal static class Cli
         return 0;
     }
 
+    /// <summary>V2 Named Pipe 自检：连接、读状态、带 rect 预览、回读几何、关闭。</summary>
+    public static int V2Test(string? path)
+    {
+        using var v2 = new SeerV2();
+        if (!v2.EnsureConnected()) { Out("v2 unavailable: " + v2.LastError); return 2; }
+        var info = v2.GetInfo();
+        Out($"v2 connected: app={info?.AppVersion} versionInt={info?.VersionInt} licensed={info?.Licensed}");
+        Out($"tracking(v2)={v2.IsTracking()}");
+
+        var rect = new Native.RECT { Left = 320, Top = 180, Right = 1320, Bottom = 880 }; // 1000x700
+        if (path != null && File.Exists(path))
+        {
+            Out($"preview.open rect=({rect.Left},{rect.Top}) {rect.Width}x{rect.Height} path={path}");
+            if (!v2.PreviewOpen(path, rect)) { Out("preview.open FAILED: " + v2.LastError); return 3; }
+            Thread.Sleep(600);
+            var st = v2.PreviewState();
+            Out($"state: visible={st?.Visible} path='{st?.Path}' rect={st?.Rect}");
+            v2.PreviewClose();
+            Out("closed");
+        }
+        return 0;
+    }
+
     public static int FixTracking()
     {
         var files = SeerSettings.CandidateFiles();

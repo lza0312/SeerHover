@@ -2,6 +2,18 @@
 
 本项目版本号遵循 `主版本.次版本.修订号`；每个版本对应一个 GitHub Release，安装包只在 Releases 发布。
 
+## [1.0.2] - 2026-11-18
+
+适配 Seer 4.8.x Win32 测试版（作者版），用官方 V2 IPC 消除预览跳动。旧版 Seer 自动回退到原路径。
+
+### 新增 / 适配
+
+- **接入 Seer V2 Named Pipe JSON-RPC**（`SeerV2.cs`）：按官方 SDK 用 `\\.\pipe\Seer.IPC.v2.<SessionId>`，权限掩码 `0x0012018B`、SQOS 防冒充、server session / owner SID 校验、失败 2 秒冷却与 `-32002` 重连重试。
+- **悬停预览改用 `seer.preview.open` 带 `rect`**：几何和路径一起发给 Seer，从源头禁掉 content-fit 自动缩放。实测 3000×2000 大图请求 900×600，1.5 秒内窗口尺寸位置纹丝不动（仅被最小高度夹到 900×645），彻底消除「先铺成原始尺寸再缩回」的跳动。V2 不可用时自动回退 5000 + SetWindowPos 纠偏。
+- **适配新版配置路径**：Seer 4.8.x 把 `tracking_file` / `keep_wnd_sz_pos_mode` 从 `user.ini` 挪到 `%LOCALAPPDATA%\Corey\Seer\config.ini`，候选文件列表已包含它。V2 可用时以 `seer.app.getState.tracking` 为权威状态；实测新版能热加载 tracking 改动，无需重启 Seer。
+- **不再擅自改全局 keep 模式**：V2 可用时跳过 `keep_wnd_sz_pos_mode` 修改（rect 已接管尺寸），避免影响空格预览的自适应行为。
+- 新增诊断命令 `--v2 [路径]`：连通性、版本、tracking、带 rect 预览与几何回读自检。
+
 ## [1.0.1] - 2026-11-12
 
 稳定性与可维护性改进，**功能行为与 1.0.0 完全一致**，用户配置无需改动。

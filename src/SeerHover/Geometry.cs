@@ -50,6 +50,31 @@ internal sealed class GeometryController
         try { cts.Cancel(); } catch (ObjectDisposedException) { }
     }
 
+    /// <summary>
+    /// 只算目标几何、不碰窗口。供 V2 的 preview.open(rect) 在触发预览前同步取 rect：
+    /// rect 必须和路径一起发出去，才能禁掉 Seer 的 content-fit 自动缩放。
+    /// 返回 null 表示 sizeMode=seer（完全交给 Seer）。
+    /// </summary>
+    public Native.RECT? Plan(HoverTarget target, Native.POINT cursor)
+    {
+        var cfg = _cfg.Geometry;
+        string sizeMode = (cfg.SizeMode ?? "fixed").ToLowerInvariant();
+        if (sizeMode == "seer") return null;
+
+        int minW = _floorW > 0 ? _floorW : DefaultMinW;
+        int minH = _floorH > 0 ? _floorH : DefaultMinH;
+
+        int srcW = 0, srcH = 0;
+        if (sizeMode == "auto") (srcW, srcH) = MediaSize.Probe(target.Path);
+
+        var mi = Native.MonitorOf(cursor.X, cursor.Y);
+        var screen = mi.rcMonitor.IsEmpty ? mi.rcWork : mi.rcMonitor;
+        var work = mi.rcWork.IsEmpty ? mi.rcMonitor : mi.rcWork;
+
+        var (width, height) = TargetSize(cfg, sizeMode, srcW, srcH, screen, minW, minH, default);
+        return Place(target, default, work, cfg, width, height, cursor);
+    }
+
     public void Apply(HoverTarget target, Native.POINT cursor)
     {
         Cancel();

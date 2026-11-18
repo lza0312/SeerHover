@@ -4,7 +4,9 @@ namespace SeerHover;
 /// Seer 的「跟随资源管理器选中项」(tracking) 会覆盖 IPC 传进来的路径：
 /// 预览刚弹出约 300ms 后，Seer 会把画面切回资源管理器当前选中项（没有选中项时切到第一项）。
 /// 悬停预览必须关掉它，否则永远会「跳回上次点选的文件」。
-/// 商店版设置在 uwp.ini，桌面版在 user.ini，两种都尝试。
+/// 配置位置随版本变过多次：商店版 uwp.ini / 老桌面版 user.ini /
+/// 4.8.x 新版（Win32）全部挪到 %LOCALAPPDATA%\Corey\Seer\config.ini。
+/// 这里按「最可能生效的在前」列出，逐个尝试。
 /// </summary>
 internal static class SeerSettings
 {
@@ -16,6 +18,15 @@ internal static class SeerSettings
         var list = new List<string>();
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
 
+        // 4.8.x Win32 测试版：tracking_file / keep_wnd_sz_pos_mode 都在 config.ini
+        // （user.ini 只剩 viewer 相关设置，没有这两项）。放最前面优先命中。
+        string desktop = Path.Combine(local, "Corey", "Seer");
+        foreach (var f in new[] { "config.ini", "user.ini", "uwp.ini" })
+        {
+            string p = Path.Combine(desktop, f);
+            if (File.Exists(p)) list.Add(p);
+        }
+
         // 微软商店版：%LOCALAPPDATA%\Packages\<包名>\LocalCache\Local\Corey\Seer\
         try
         {
@@ -26,23 +37,16 @@ internal static class SeerSettings
                 {
                     string baseDir = Path.Combine(dir, "LocalCache", "Local", "Corey", "Seer");
                     if (!Directory.Exists(baseDir)) continue;
-                    foreach (var f in new[] { "uwp.ini", "user.ini" })
+                    foreach (var f in new[] { "uwp.ini", "user.ini", "config.ini" })
                     {
                         string p = Path.Combine(baseDir, f);
-                        if (File.Exists(p)) list.Add(p);
+                        if (File.Exists(p) && !list.Contains(p, StringComparer.OrdinalIgnoreCase)) list.Add(p);
                     }
                 }
             }
         }
         catch { }
 
-        // 桌面安装版
-        string desktop = Path.Combine(local, "Corey", "Seer");
-        foreach (var f in new[] { "uwp.ini", "user.ini" })
-        {
-            string p = Path.Combine(desktop, f);
-            if (File.Exists(p)) list.Add(p);
-        }
         return list;
     }
 

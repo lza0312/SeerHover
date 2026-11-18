@@ -21,6 +21,7 @@ internal static class Program
             ["--status"] = () => Cli.Run(Cli.Status, "status"),
             ["--items"] = () => Cli.Run(Cli.Items, "items"),
             ["--ipc"] = () => Cli.Run(() => Cli.IpcTest(args.Length > 1 ? args[1] : null), "ipc"),
+            ["--v2"] = () => Cli.Run(() => Cli.V2Test(args.Length > 1 ? args[1] : null), "v2"),
             ["--media"] = () => Cli.Run(() => Cli.MediaInfo(args.Length > 1 ? args[1] : null), "media"),
             ["--windows"] = () => Cli.Run(Cli.SeerWindows, "windows"),
             ["--fix-tracking"] = () => Cli.Run(Cli.FixTracking, "fixtracking"),

@@ -35,28 +35,28 @@ Seer 的插件体系只做「预览渲染」，不做「触发」：
 1. **不用 `ElementFromPoint`。** 这版 Windows（26H2）的文件列表已换成 WinUI 控件，祖先链里取不到 `ListItem`。
    改成「枚举窗口内所有 `ListItem` 的矩形 + 坐标命中测试」，顺带获得缓存能力。
 2. **先声明 Per-Monitor V2 DPI 感知。** 否则 `GetWindowRect` 返回的是被 150% 缩放虚拟化后的坐标，和 UIA 的物理坐标差 1.5 倍，命中永远不中。
-3. **窗口几何必须靠 Seer 自己的机制固定下来。** Seer 的 IPC 没有位置/尺寸指令，而它默认每次显示都按内容重设窗口
-   （图片会先撑成原始尺寸再收回），硬顶就会「预览大小来回跳」。解决办法是打开它的 `keep_wnd_sz_pos_mode`，见下一节。
+3. **窗口几何必须提前交给 Seer。** 老版 Seer 没有位置/尺寸 IPC，只能在它按内容撑大后硬顶，会「预览大小来回跳」，
+   只能靠 `keep_wnd_sz_pos_mode=1` 兜底。**Seer 4.8.x 起用 V2 IPC 的 `seer.preview.open` 带 `rect`**，
+   几何和路径一起发出，从源头禁用 content-fit，跳动问题根治（见下方「V2 IPC」）。
 4. **必须关掉 Seer 的「跟随资源管理器选中项」。** 详见下一节——开着它，悬停会一直跳回上次点选的文件。
 
-## 关键前提一：Seer 的「保持窗口大小位置」要打开
+## 关键前提一：窗口尺寸（V2 IPC 已自动处理）
 
-`uwp.ini` 里的 `keep_wnd_sz_pos_mode`（Seer 设置里的 *Keep window size & position*）。
+- **Seer 4.8.x（作者测试版）**：走 V2 IPC 的 `seer.preview.open` 并附带 `rect`，几何与路径同时下发，
+  Seer 不再按内容自动缩放窗口。**不需要**改 `keep_wnd_sz_pos_mode`，空格预览仍按图片自适应。
+- **老版 Seer（无 V2）**：回退到 5000 + `SetWindowPos` 纠偏，仍需打开 `keep_wnd_sz_pos_mode=1`
+  （在 `user.ini` / `uwp.ini`；Seer 4.8.x 则在 `%LOCALAPPDATA%\Corey\Seer\config.ini`）。
+  工具仅在 V2 不可用时才自动改它，带一次性备份。
 
-- **默认值 0**：每次预览都按内容重设窗口尺寸。图片会先铺成原始尺寸（实测能到 1794×1794），
-  把窗口缩到设定值后它又会撑回去 —— 这就是「预览大小来回跳」的根源，光靠外部 `SetWindowPos` 顶不住。
-- **设为 1 之后**：窗口尺寸不再随内容变化，而且会记住上次的尺寸和位置。实测第二次触发时
-  窗口**一出现就是 900×700 且位置正确，全程零变化**。
+手动命令：`SeerHover.exe --keep-window`（开启）/ `--restore-window`（恢复默认）。
+诊断 V2 是否接管：`SeerHover.exe --v2`（会打印版本、tracking、rect 回读结果）。
 
-工具在启动时会自动把它设为 1（带一次性备份），托盘也会提示一次「重启 Seer 生效」。
-手动执行：`SeerHover.exe --keep-window`（开启）/ `--restore-window`（恢复 Seer 默认）。
-
-副作用的实话：打开后**用空格预览也不再按图片大小自适应**，窗口固定成你设定的尺寸。
-如果想恢复 Seer 原生行为，跑 `--restore-window`（代价是悬停时窗口大小又会跳）。
+> 老版的副作用：打开 keep 模式后**空格预览也不再按图片大小自适应**。V2 路径下无此问题。
 
 ## 关键前提二：Seer 的「跟随选中项」必须关闭
 
-Seer 有个选项 **Track selected file in Explorer**（`uwp.ini` 里的 `tracking_file`）。
+Seer 有个选项 **Track selected file in Explorer**（配置文件里的 `tracking_file`）。
+配置文件位置随版本变：4.8.x 在 `%LOCALAPPDATA%\Corey\Seer\config.ini`，老版在 `user.ini` / `uwp.ini`。
 开着它时，预览窗弹出约 300–500ms 后会把画面切到「资源管理器当前选中项」：
 
 | 场景 | 现象 |
@@ -73,8 +73,8 @@ Seer 有个选项 **Track selected file in Explorer**（`uwp.ini` 里的 `tracki
    对不上就立刻收窗（宁可什么都不显示，也不显示错的文件），并再次提示修复。
 3. **托盘菜单「修复 Seer『跟随选中项』」**，随时可手动执行。
 
-想恢复 Seer 原来的跟随行为：`SeerHover.exe --restore-tracking`（会把 `uwp.ini.seerhover.bak` 还原回去），
-或直接在 Seer 设置里重新勾选。
+想恢复 Seer 原来的跟随行为：`SeerHover.exe --restore-tracking`（会把对应配置文件的 `.seerhover.bak` 还原回去），
+或直接在 Seer 设置里重新勾选。V2 可用时以 `seer.app.getState.tracking` 为权威状态；实测 Seer 4.8.x 能热加载该改动，无需重启。
 
 
 ## 快速开始
@@ -208,8 +208,10 @@ Seer 有个选项 **Track selected file in Explorer**（`uwp.ini` 里的 `tracki
 - 1ms 定时精度只在「预览窗口定位」那几百毫秒内临时开启（`TimerResolution`），进程空闲时不再让整机跑在 1ms 定时上。
 - 源文件尺寸探测固定用一根低于普通优先级的后台 STA 线程 + 复用的 Shell 实例，不再「一个文件一根线程」。
 - **追踪干扰（实测数据）**：`tracking_file=true` 时，发送 B 后的 250ms 还显示 B，500ms 已切回选中的 A；
-  重复发送同样无效。改为 `false` 后，2 秒内稳定显示 B。商店版该键在
-  `%LOCALAPPDATA%\Packages\<包名>\LocalCache\Local\Corey\Seer\uwp.ini`（`user.ini` 里没有这一项）。
+  重复发送同样无效。改为 `false` 后，2 秒内稳定显示 B。配置位置：Seer 4.8.x 在
+  `%LOCALAPPDATA%\Corey\Seer\config.ini`；商店版在
+  `%LOCALAPPDATA%\Packages\<包名>\LocalCache\Local\Corey\Seer\uwp.ini`。
+  V2 可用时用 `seer.app.getState.tracking` 直接读实时状态，不依赖文件。
 
 ## 已知限制
 
@@ -217,7 +219,8 @@ Seer 有个选项 **Track selected file in Explorer**（`uwp.ini` 里的 `tracki
 - **虚拟目录拿不到真实路径**：搜索结果、压缩包内部、回收站、此电脑等会静默跳过（宁可不弹，也不弹错）。
 - 资源管理器开启「隐藏已知扩展名」时，靠 `名字.*` 唯一匹配兜底；同名多扩展会跳过。
 - 分辨率/比例差别太大时，`Geometry.Width/Height` 需要重调；低于 Seer 的最小窗口（150% 缩放下 765×645）会被自动抬升。
-- 首次开启「保持窗口大小位置」后，第一次预览会从上次的旧尺寸过渡一次（约 10ms），之后固定不变。
+  V2 实测最小尺寸为 510×430 × DPI（150% 下约 765×645），请求 900×600 会被夹到 900×645。
+- V2 路径下窗口尺寸由 `rect` 一次定好，不再有「保持窗口大小位置」首次预览的旧尺寸过渡。
 - **不能开 Seer 的「跟随选中项」**：开了就会跳回选中项/文件夹第一项。工具会尽量自动关掉，
   但 Seer 每次启动会读回自己的配置，所以如果在 Seer 界面里又勾上，需要再执行一次修复并重启 Seer。
 - **不要关掉「保持窗口大小位置」**：关掉后 Seer 会按内容重设窗口，悬停预览的大小会跳（工具只能兜底纠正，仍有约 20–30ms 的过渡）。
