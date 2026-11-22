@@ -41,8 +41,9 @@ internal sealed class GeometryConfig
     public bool UpscaleToFill { get; set; } = true;
 
     /// <summary>
-    /// 按媒体类别覆盖尺寸策略。key 见 <see cref="MediaKind"/>（image/video/audio/web/text/archive/document/other），
-    /// 值为 auto（原比例最大化）/ seer（跟随 Seer）/ fixed（用配置宽高）；缺失或空 = 用全局 SizeMode。
+    /// 按媒体类别覆盖尺寸策略。key 见 <see cref="MediaKind"/>（image/video/audio/web/text/archive/document/folder/other），
+    /// 值为 auto（原比例最大化）/ seer（跟随 Seer）/ fixed（用配置宽高）/ off（关闭悬浮，保留 Seer 空格预览）；
+    /// 缺失或空 = 用全局 SizeMode。
     /// </summary>
     public Dictionary<string, string>? CategoryModes { get; set; }
 
@@ -69,7 +70,10 @@ internal sealed class AppConfig
     /// <summary>两次触发的最小间隔，Seer IPC 硬性要求 >= 200ms</summary>
     public int MinInvokeIntervalMs { get; set; } = 220;
 
-    /// <summary>目录项是否触发预览</summary>
+    /// <summary>
+    /// 目录项是否触发预览。已并入分类尺寸策略（窗口 → 尺寸 → 文件夹选「关闭悬浮」即不预览）；
+    /// 仅作旧配置迁移依据，运行时不再直接读取。
+    /// </summary>
     public bool PreviewFolders { get; set; } = false;
 
     /// <summary>媒体控件条初始音量（0-100，只作用于 Seer 的会话音量）</summary>
@@ -291,33 +295,54 @@ internal sealed class AppConfig
             _ => "cursor"
         };
 
-        // 固定尺寸下限放宽到 320x240：音频等类别想要小窗预览。
-        // Seer 若坚持自己的最小窗（150% 缩放下 765x645）会自动夹回，盯梢逻辑会采纳实际值。
-        if (Geometry.Height > 0 && Geometry.Height < 240)
+        // 固定尺寸下限 = Seer 的最小窗口 765x645（实测对所有内容一致，含音频）：
+        // 更小的请求会被 Seer 硬夹回且位置按小尺寸算错，这里直接钳到下限。
+        if (Geometry.Height > 0 && Geometry.Height < 645)
         {
-            Logger.Info($"config Height={Geometry.Height} 小于下限，已提升为 240");
-            Geometry.Height = 240;
+            Logger.Info($"config Height={Geometry.Height} 小于 Seer 最小窗，已提升为 645");
+            Geometry.Height = 645;
         }
-        if (Geometry.Width > 0 && Geometry.Width < 320)
+        if (Geometry.Width > 0 && Geometry.Width < 765)
         {
-            Logger.Info($"config Width={Geometry.Width} 小于下限，已提升为 320");
-            Geometry.Width = 320;
+            Logger.Info($"config Width={Geometry.Width} 小于 Seer 最小窗，已提升为 765");
+            Geometry.Width = 765;
+        }
+
+        // 按类别的尺寸覆盖同样钳到下限
+        if (Geometry.CategorySizes != null)
+        {
+            foreach (var key in Geometry.CategorySizes.Keys.ToList())
+            {
+                var s = Geometry.CategorySizes[key];
+                if (s is { Length: 2 } && (s[0] < 765 || s[1] < 645))
+                {
+                    Logger.Info($"config CategorySizes[{key}]={s[0]}x{s[1]} 小于 Seer 最小窗，已提升");
+                    Geometry.CategorySizes[key] = new[] { Math.Max(s[0], 765), Math.Max(s[1], 645) };
+                }
+            }
         }
 
         // 上限 8K（7680x4320），足够 4K / 5K2K 带鱼屏；再大没有意义，还会让 Seer 摆到屏幕外
         if (Geometry.Width > 7680) Geometry.Width = 7680;
         if (Geometry.Height > 4320) Geometry.Height = 4320;
 
-        // 按类别的尺寸覆盖：只认 auto / seer / fixed，空值和未知 key 直接丢掉（等价于跟随全局）
+        // 按类别的尺寸覆盖：只认 auto / seer / fixed / off，空值和未知 key 直接丢掉（等价于跟随全局）
         if (Geometry.CategoryModes != null)
         {
             var cleaned = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var (k, v) in Geometry.CategoryModes)
             {
                 string mode = (v ?? string.Empty).Trim().ToLowerInvariant();
-                if (mode is "auto" or "seer" or "fixed") cleaned[k.Trim().ToLowerInvariant()] = mode;
+                if (mode is "auto" or "seer" or "fixed" or "off") cleaned[k.Trim().ToLowerInvariant()] = mode;
             }
             Geometry.CategoryModes = cleaned.Count > 0 ? cleaned : null;
+        }
+
+        // 「文件夹也预览」开关已并入分类尺寸：folder 类别没有显式设置时按旧开关迁移，保持既有行为。
+        if (Geometry.CategoryModes == null || !Geometry.CategoryModes.ContainsKey("folder"))
+        {
+            (Geometry.CategoryModes ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))["folder"] =
+                PreviewFolders ? "fixed" : "off";
         }
 
         // 按类别的固定宽高：宽高夹到 320x240 ~ 8K（下限放宽，小窗预览用）；无效条目丢弃

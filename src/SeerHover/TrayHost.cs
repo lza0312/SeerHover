@@ -71,6 +71,18 @@ internal sealed class TrayHost : ApplicationContext
             ContextMenuStrip = menu
         };
         _tray.DoubleClick += (_, _) => OpenSettings();
+        // 系统双击判定有时不生效（菜单抢占 / 点击间隔偏长）：自己按两次单击配对，阈值放宽
+        int lastTrayClick = 0;
+        _tray.Click += (_, _) =>
+        {
+            int now = Environment.TickCount;
+            if (now - lastTrayClick <= SystemInformation.DoubleClickTime + 300)
+            {
+                lastTrayClick = 0;
+                OpenSettings();
+            }
+            else lastTrayClick = now;
+        };
 
         // 需要一个隐藏控件来把回调切回 UI 线程
         _invoker = new Control();

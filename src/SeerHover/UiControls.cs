@@ -21,32 +21,81 @@ internal sealed class WrapLabel : Control
     /// <summary>
     /// 自己按字符折行。GDI 的 DT_WORDBREAK 对纯中文长文案会漏画首行（实测设置页说明只剩后半截），
     /// 所以这里显式算出每行，绘制和测量用同一份结果，行数一定对得上。
+    /// 测量结果缓存在前缀宽度表里：文本/字体不变时折行是纯算术——
+    /// 拖动窗口边缘逐像素重排时不再反复调 GDI MeasureText（整页几千次/像素，是 resize 卡顿的根源）。
     /// </summary>
     internal List<string> Lines(int width)
     {
-        var lines = new List<string>();
-        if (string.IsNullOrEmpty(Text)) return lines;
+        EnsureMeasureCache();
+        if (_linesCache != null && _linesCacheWidth == width && _linesCacheText == Text && _linesCacheFont == Font)
+            return _linesCache;
 
-        int limit = Math.Max(10, width);
-        var flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
-        var sb = new StringBuilder();
-        foreach (char c in Text)
+        var lines = new List<string>();
+        if (!string.IsNullOrEmpty(Text))
         {
-            if (c == '\n') { lines.Add(sb.ToString()); sb.Clear(); continue; }
-            sb.Append(c);
-            var size = TextRenderer.MeasureText(sb.ToString(), Font, Size.Empty, flags);
-            if (size.Width > limit && sb.Length > 1)
+            int limit = Math.Max(10, width);
+            int start = 0;
+            for (int i = 0; i < Text.Length; i++)
             {
-                lines.Add(sb.ToString(0, sb.Length - 1));
-                sb.Clear();
-                sb.Append(c);
+                char c = Text[i];
+                if (c == '\n')
+                {
+                    lines.Add(Text.Substring(start, i - start));
+                    start = i + 1;
+                    continue;
+                }
+                // 行宽 = 前缀宽差（当前行起点到当前字符），不是从头算的前缀宽——
+                // 否则第二行起每个字符都会被当成超宽，折成一字一行
+                if (PrefixWidth(i + 1) - PrefixWidth(start) > limit && i > start)
+                {
+                    lines.Add(Text.Substring(start, i - start));
+                    start = i;
+                }
             }
+            if (start < Text.Length) lines.Add(Text[start..]);
         }
-        if (sb.Length > 0) lines.Add(sb.ToString());
+
+        _linesCache = lines;
+        _linesCacheWidth = width;
+        _linesCacheText = Text;
+        _linesCacheFont = Font;
         return lines;
     }
 
-    private int LineHeight => Math.Max(TextRenderer.MeasureText("字", Font).Height, Font.Height);
+    private List<string>? _linesCache;
+    private int _linesCacheWidth;
+    private string? _linesCacheText;
+    private Font? _linesCacheFont;
+    private int[]? _prefixW;          // 前缀宽度表：prefixW[i] = MeasureText(Text[0..i])
+    private string? _prefixText;
+    private Font? _prefixFont;
+    private int _lineHeight = -1;
+    private Font? _lineHeightFont;
+
+    private void EnsureMeasureCache()
+    {
+        if (_prefixFont == Font && _prefixText == Text && _prefixW != null) return;
+        _prefixW = new int[Text.Length + 1];
+        var flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+        for (int i = 1; i <= Text.Length; i++)
+            _prefixW[i] = TextRenderer.MeasureText(Text[..i], Font, Size.Empty, flags).Width;
+        _prefixText = Text;
+        _prefixFont = Font;
+        _linesCache = null;
+    }
+
+    private int PrefixWidth(int count) => _prefixW![count];
+
+    private int LineHeight
+    {
+        get
+        {
+            if (_lineHeightFont == Font && _lineHeight > 0) return _lineHeight;
+            _lineHeight = Math.Max(TextRenderer.MeasureText("字", Font).Height, Font.Height);
+            _lineHeightFont = Font;
+            return _lineHeight;
+        }
+    }
 
     /// <summary>给定宽度下需要的高度（设备像素），用于按内容撑行高。</summary>
     public int MeasureHeight(int width) => Lines(width).Count * LineHeight + 2;
@@ -138,7 +187,38 @@ internal sealed class ScrollHost : Panel
     {
         base.OnClientSizeChanged(e);
         ApplyLayout();
+        ScheduleViewport();
+    }
+
+    // 拖拽边缘时 WM_SIZE 每像素一发，全量重排跟不上 → 节流到 ~20fps（首发立即、后续 50ms 合并一次）
+    private System.Windows.Forms.Timer? _vpTimer;
+
+    private void ScheduleViewport()
+    {
         ViewportChanged?.Invoke(this, EventArgs.Empty);
+        if (_vpTimer != null) return;
+        var t = new System.Windows.Forms.Timer { Interval = 50 };
+        t.Tick += (_, _) =>
+        {
+            t.Stop();
+            t.Dispose();
+            ViewportChanged?.Invoke(this, EventArgs.Empty);
+        };
+        _vpTimer = t;
+        t.Start();
+    }
+
+    private void StopViewportTimer()
+    {
+        _vpTimer?.Stop();
+        _vpTimer?.Dispose();
+        _vpTimer = null;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) StopViewportTimer();
+        base.Dispose(disposing);
     }
 
     /// <summary>内部布局算完后回调：报告内容总高度。</summary>
@@ -749,6 +829,10 @@ internal sealed class CardPanel : Panel
     public int PadV { get; set; }
 
     private readonly List<Control> _items = new();
+    private int _lastW = -1;
+
+    /// <summary>行可见性等非宽度因素变了：下一次 Reflow 不能因宽度没变而跳过。</summary>
+    public void InvalidateLayout() => _lastW = -1;
 
     public CardPanel()
     {
@@ -773,6 +857,8 @@ internal sealed class CardPanel : Panel
     public void Reflow(int width)
     {
         if (width <= 0) return;
+        if (width == _lastW) return;   // 宽度没变且无显式失效 → 布局不变，跳过整个重排
+        _lastW = width;
         SuspendLayout();
         Width = width;
         int inner = Math.Max(1, width - PadH * 2);

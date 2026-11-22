@@ -42,13 +42,9 @@ internal sealed class GeometryController
     private const int DefaultMinW = 765;
     private const int DefaultMinH = 645;
 
-    /// <summary>固定尺寸的硬上限：8K（7680×4320），4K / 5K2K 带鱼屏都在范围内</summary>
+    /// <summary>固定尺寸的软上限：8K（7680×4320），4K / 5K2K 带鱼屏都在范围内</summary>
     public const int MaxFixedW = 7680;
     public const int MaxFixedH = 4320;
-
-    /// <summary>固定尺寸的软下限：320×240（音频等类别的小窗预览）。</summary>
-    public const int MinFixedW = 320;
-    public const int MinFixedH = 240;
 
     public GeometryController(AppConfig cfg, SeerIpc ipc)
     {
@@ -70,7 +66,8 @@ internal sealed class GeometryController
     /// </summary>
     public Native.RECT? Plan(HoverTarget target, Native.POINT cursor)
     {
-        if (EffectiveSizeMode(_cfg.Geometry, target.Path) == "seer") return null;
+        string mode = EffectiveSizeMode(_cfg.Geometry, target.Path);
+        if (mode == "seer" || mode == "off") return null;
         return Compute(target, cursor, default, preSet: true).Rect;
     }
 
@@ -89,6 +86,7 @@ internal sealed class GeometryController
                 "auto" => "auto",
                 "seer" => "seer",
                 "fixed" => "fixed",
+                "off" => "off",
                 _ => (cfg.SizeMode ?? "fixed").ToLowerInvariant()
             };
         }
@@ -233,9 +231,9 @@ internal sealed class GeometryController
             stable = 0;
             misses++;
 
-            // 差异很小 → Seer 的最小尺寸夹取，记住并采纳，别再顶
-            bool near = r.Width <= width * 1.25 && r.Height <= height * 1.25;
-            if (near && r.Width >= width && r.Height >= height)
+            // 位置吻合且实际比目标大 → Seer 的最小窗夹取：记住并采纳，别再顶
+            bool posOk = Math.Abs(r.Left - rect.Left) <= 4 && Math.Abs(r.Top - rect.Top) <= 4;
+            if (posOk && r.Width >= width && r.Height >= height)
             {
                 if (r.Width > width) _floorW = r.Width;
                 if (r.Height > height) _floorH = r.Height;
@@ -327,11 +325,17 @@ internal sealed class GeometryController
                         continue;
                     }
 
-                    // 差异很小且比目标大 → Seer 的最小窗夹取，接受，别再顶
-                    bool near = r.Width <= rect.Width * 1.25 && r.Height <= rect.Height * 1.25;
-                    if (near && r.Width >= rect.Width && r.Height >= rect.Height)
+                    // 位置吻合且实际比目标大 → Seer 的最小窗夹取：采纳实际尺寸并拉回工作区
+                    bool posOk = Math.Abs(r.Left - rect.Left) <= 4 && Math.Abs(r.Top - rect.Top) <= 4;
+                    if (posOk && r.Width >= rect.Width && r.Height >= rect.Height)
                     {
                         if (Logger.IsVerbose) Logger.Info($"geometry watch adopt floor: {r.Width}x{r.Height}");
+                        int aw = r.Width, ah = r.Height;
+                        int al = rect.Left, at = rect.Top;
+                        var mi2 = Native.MonitorOf(rect.Left + rect.Width / 2, rect.Top + rect.Height / 2);
+                        var work2 = mi2.rcWork.IsEmpty ? mi2.rcMonitor : mi2.rcWork;
+                        ClampToWork(ref al, ref at, aw, ah, work2);
+                        MoveTo(al, at, aw, ah);
                         break;
                     }
 
@@ -485,15 +489,16 @@ internal sealed class GeometryController
 
         // 固定尺寸：只受「屏幕尺寸」和 8K 上限约束，不再被占屏比压小，
         // 这样 4K 屏可以把高度直接设成 2160（铺满整屏）。
-        // 下限 320x240（音频等类别想要小窗预览）；Seer 若坚持自己的最小窗会夹回，
-        // 盯梢逻辑会把被夹大的值当作实际值采纳，不会抖动。
+        // 下限 = Seer 的最小窗口（实测对音频等所有内容一致）：Seer 会把更小的请求
+        // 硬夹到 765x645，这里主动抬到同一大小，位置按最终尺寸计算，否则
+        // 窗口会按小尺寸摆位、被 Seer 撑大后溢出屏幕（表现为「位置不对、宽度没生效」）。
         int capW = Math.Max(minW, Math.Min(scrW, MaxFixedW));
         int capH = Math.Max(minH, Math.Min(scrH, MaxFixedH));
 
         int fw = cfgW > 0 ? cfgW : current.Width;
         int fh = cfgH > 0 ? cfgH : current.Height;
-        fw = Math.Clamp(fw, Math.Min(MinFixedW, capW), capW);
-        fh = Math.Clamp(fh, Math.Min(MinFixedH, capH), capH);
+        fw = Math.Clamp(fw, minW, capW);
+        fh = Math.Clamp(fh, minH, capH);
         return (fw, fh);
     }
 

@@ -89,7 +89,7 @@ internal sealed class HoverResolver
         }
         else if (Directory.Exists(candidate))
         {
-            if (!_cfg.PreviewFolders) { why = "folder item (skipped)"; return null; }
+            // 文件夹是否预览由分类尺寸策略决定（folder 类别默认「关闭悬浮」，见 AppConfig.Normalize 的迁移）
             resolved = candidate;
             isDir = true;
         }
@@ -105,6 +105,12 @@ internal sealed class HoverResolver
         }
 
         if (resolved == null) { why = $"path not found: {folder} + '{name}'"; return null; }
+        if (GeometryController.EffectiveSizeMode(_cfg.Geometry, resolved) == "off")
+        {
+            // 该类别选了「关闭悬浮」：不弹悬停预览，回归 Seer 自己的空格预览
+            why = "preview disabled for category";
+            return null;
+        }
         if (_cfg.IsExcluded(resolved)) { why = "excluded by config"; return null; }
 
         why = "ok";

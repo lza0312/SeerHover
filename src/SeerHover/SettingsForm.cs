@@ -417,7 +417,6 @@ internal sealed class SettingsForm : Form, IMessageFilter
         stack.Section("基本");
         stack.Card(
             ToggleRow("启用悬停预览", "总开关，关掉后等同于暂停。", _work.Enabled, v => _work.Enabled = v),
-            ToggleRow("文件夹也预览", "默认只对文件生效；开启后悬停文件夹同样弹出预览。", _work.PreviewFolders, v => _work.PreviewFolders = v),
             ToggleRow("开机自启", "登录 Windows 后在托盘里自动运行。", _host.IsStartupEnabled(), v => _host.SetStartup(v)),
             ToggleRow("双击空白处回到上一层",
                 "在资源管理器文件列表的空白处双击，等同于按 Alt+↑ 返回上一层文件夹；双击文件/文件夹本身不受影响。",
@@ -492,11 +491,12 @@ internal sealed class SettingsForm : Form, IMessageFilter
 
         stack.Gap(16);
         stack.Section("尺寸");
-        stack.Note("每类文件单独选尺寸策略；选「固定」出现宽 / 高滑杆，选「比例最大化」出现放大填满与占屏比。");
-
         // 一张卡装下全部：分类之间细线分隔（同位置卡内样式），分类与它的参数行之间无分隔。
+        // Seer / 关闭悬浮的说明放在各自分类行下方的说明行里（与固定 / 比例最大化的参数行同位置）。
         var fixedRows = new Dictionary<string, SettingRow>();
         var ratioRows = new Dictionary<string, SettingRow>();
+        var seerRows = new Dictionary<string, SettingRow>();
+        var offRows = new Dictionary<string, SettingRow>();
         var catRows = new List<SettingRow>();
         foreach (var kind in MediaKind.Categories)
         {
@@ -511,6 +511,12 @@ internal sealed class SettingsForm : Form, IMessageFilter
             var fixedRow = CategoryFixedRow(kind);
             fixedRow.GroupWithPrev = true;
             catRows.Add(fixedRows[kind] = fixedRow);
+            var seerRow = ModeNoteRow("不干预尺寸，按 Seer 原始窗口大小预览。");
+            seerRow.GroupWithPrev = true;
+            catRows.Add(seerRows[kind] = seerRow);
+            var offRow = ModeNoteRow("不弹悬停预览，保留 Seer 自己的空格预览。");
+            offRow.GroupWithPrev = true;
+            catRows.Add(offRows[kind] = offRow);
         }
         stack.Card(catRows.ToArray());
         UpdateCategoryRows();
@@ -525,6 +531,10 @@ internal sealed class SettingsForm : Form, IMessageFilter
                 row.RowVisible = Effective(kind) == "fixed";
             foreach (var (kind, row) in ratioRows)
                 row.RowVisible = Effective(kind) == "auto";
+            foreach (var (kind, row) in seerRows)
+                row.RowVisible = Effective(kind) == "seer";
+            foreach (var (kind, row) in offRows)
+                row.RowVisible = Effective(kind) == "off";
             stack.Reflow();
         }
 
@@ -541,23 +551,50 @@ internal sealed class SettingsForm : Form, IMessageFilter
         MediaKind.Text => "txt · md · json · xml · 代码与字幕",
         MediaKind.Archive => "zip · rar · 7z · tar · iso",
         MediaKind.Document => "pdf · office · epub · djvu",
-        MediaKind.Folder => "目录（开启「文件夹也预览」后生效）",
+        MediaKind.Folder => "目录（关闭悬浮时不预览）",
         _ => "未登记的扩展名一律归到这里"
     };
 
     /// <summary>
+    /// Seer / 关闭悬浮模式下的说明行（与固定 / 比例最大化参数行同位置，GroupWithPrev）：单行灰字说明。
+    /// </summary>
+    private SettingRow ModeNoteRow(string text)
+    {
+        var d = DescLabel(text);
+        int descNeedW = TextRenderer.MeasureText(text, Theme.Small).Width;
+        var row = new SettingRow((r, w) =>
+        {
+            int h = S(36);
+            r.Height = h;
+            int maxW = w - S(10) - S(10);
+            d.Visible = maxW >= descNeedW;
+            if (d.Visible) d.Bounds = new Rectangle(S(10), (h - S(22)) / 2, maxW, S(22));
+        });
+        row.Controls.Add(d);
+        return row;
+    }
+
+    /// <summary>
     /// 分类选「比例最大化」时显示的参数行（跟随分类行，GroupWithPrev）：
-    /// 左窄 = 放大填满窗口（开关），右宽 = 最大占屏比（滑杆 + 输入框）。
+    /// 结构对齐「固定」参数行——左右两半各占一半、滑杆随窗口宽度伸缩：
+    /// 左半 = 放大填满窗口（标题 + 开关，标题下方一行说明），右半 = 占屏比（标签 + 滑杆 + 输入框）。
+    /// 行高与「固定」参数行一致；说明一行放不下（窗口过窄）就整段隐藏。
     /// 两个值是全局配置（Geometry.UpscaleToFill / MaxScreenRatio），多个分类行显示的是同一组值，
     /// 重排时把控件显示同步到全局，改任意一行其它行跟着变。
     /// </summary>
     private SettingRow RatioParamsRow()
     {
         var t = TitleLabel("放大填满窗口");
-        var d = DescLabel("小尺寸文件生成临时放大副本，Seer 才会把窗口填满。");
+        var d = DescLabel("小尺寸文件生成临时放大副本。");
+        var tl = TitleLabel("占屏比");
         var sw = new ToggleSwitch { Checked = _work.Geometry.UpscaleToFill };
         var nf = new NumberField(Math.Clamp((int)Math.Round(_work.Geometry.MaxScreenRatio * 100), 30, 100), 30, 100, 5, "%");
         var sl = new SliderControl { Minimum = 30, Maximum = 100, Step = 5, Value = nf.Value };
+
+        // 宽度无关的测量只做一次（布局 lambda 每次 resize 都会跑，别在里面调 GDI）
+        int titleW = TextRenderer.MeasureText(t.Text, t.Font).Width + S(4);
+        int ratioLblW = TextRenderer.MeasureText(tl.Text, tl.Font).Width + S(4);
+        int descNeedW = TextRenderer.MeasureText(d.Text, d.Font).Width;
 
         void ApplyGlobal()
         {
@@ -580,35 +617,51 @@ internal sealed class SettingsForm : Form, IMessageFilter
             sync = false;
 
             int swW = S(46), swH = S(26);
-            int fieldW = Math.Clamp(S(96), S(84), S(132)), fieldH = S(28);
+            int fieldW = Math.Clamp(S(84), S(72), S(120)), fieldH = S(28);
 
-            // 左：标题 + 开关（窄），右：滑杆 + 输入框（宽）
-            int leftW = S(150);
-            int titleH = S(28);
-            int descH = Math.Min(d.MeasureHeight(leftW), S(56));   // 最多两行，多余裁掉
-            int blockH = titleH + (descH > 0 ? S(4) + descH : 0);
-            int h = Math.Max(S(64), blockH + S(14));
+            // 行高与「固定」参数行一致（CategoryFixedRow：fieldH + 24，下限 58）
+            int h = Math.Max(S(58), fieldH + S(24));
             r.Height = h;
+            int y = (h - fieldH) / 2;
+            int sy = (h - S(26)) / 2;
 
-            int ty = Math.Max(S(6), (h - blockH) / 2);
-            t.Bounds = new Rectangle(0, ty, leftW, titleH);
-            d.Visible = descH > 0;
-            if (descH > 0) d.Bounds = new Rectangle(0, ty + titleH + S(2), leftW, descH);
+            // 两半各占一半（与固定行的两组对齐）：左 = 标题 + 开关，右 = 占屏比标签 + 滑杆 + 输入框
+            int x0 = S(10);
+            int halfW = (w - 2 * x0 - S(24)) / 2;
+
+            // 开关贴左半右缘（左半 = 标题…开关 占满，右半 = 占屏比 + 滑杆 + 输入框）
+            int swX = x0 + halfW - swW;
             sw.Size = new Size(swW, swH);
-            sw.Location = new Point(leftW + S(8), (h - swH) / 2);
+            sw.Location = new Point(swX, (h - swH) / 2);
 
-            int rightW = w - leftW - swW - S(36);
-            int sx = w - rightW;
-            int sy = (h - fieldH) / 2;
-            sl.SetBounds(sx, sy + (fieldH - S(26)) / 2, Math.Min(S(230), rightW - fieldW - S(10)), S(26));
-            nf.SetBounds(sx + Math.Min(S(230), rightW - fieldW - S(10)) + S(10), sy, fieldW, fieldH);
+            int rx = x0 + halfW + S(24);   // 右半起点
+            int slX = rx + ratioLblW + S(6);
+            int nfX = w - S(10) - fieldW;
+            sl.SetBounds(slX, sy, Math.Max(S(80), nfX - S(8) - slX), S(26));
+            nf.SetBounds(nfX, y, fieldW, fieldH);
+
+            // 左：标题 + 标题下方的一行说明（说明可用到右半起点前的全部宽度，放不下整段隐藏）
+            int blockH = S(28) + S(2) + S(22);
+            int ty = Math.Max(S(4), (h - blockH) / 2);
+            t.Bounds = new Rectangle(x0, ty, titleW, S(28));
+            tl.Bounds = new Rectangle(rx, (h - S(28)) / 2, ratioLblW, S(28));
+            int descMaxW = rx - x0 - S(16);
+            bool descOk = descMaxW >= descNeedW;
+            d.Visible = descOk;
+            if (descOk) d.Bounds = new Rectangle(x0, ty + S(28) + S(2), descMaxW, S(22));
         });
 
         row.Controls.Add(t);
         row.Controls.Add(d);
+        row.Controls.Add(tl);
         row.Controls.Add(sw);
         row.Controls.Add(sl);
         row.Controls.Add(nf);
+        // WinForms z 序与添加顺序相反（先加的在上层）：说明/占屏比标签会盖住开关和滑杆的
+        // 更新区域（开关底部被裁 13px 的实测根因），把可交互控件统一提到最上层。
+        sw.BringToFront();
+        sl.BringToFront();
+        nf.BringToFront();
         return row;
     }
 
@@ -628,7 +681,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
 
         var row = new SettingRow((r, w) =>
         {
-            int segW = S(232);   // 三个短标签足够，右侧选择框做窄
+            int segW = S(300);   // 四个选项（含「比例最大化」五字），右侧选择框做窄
             int labelW = w - segW - S(18);
             // 用 MeasureHeight（与实际折行渲染同一套测量）判断：折两行以内显示，更多 = 超出显示范围整段隐藏。
             // TextRenderer.MeasureText 对混排中文会用保守度量误判超宽，不能用来判。
@@ -652,7 +705,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         return row;
     }
 
-    private static readonly string[] CategoryOptions = { "固定", "比例最大化", "Seer" };
+    private static readonly string[] CategoryOptions = { "固定", "比例最大化", "Seer", "关闭悬浮" };
 
     private string? CurrentCategoryMode(string kind) =>
         _work.Geometry.CategoryModes != null && _work.Geometry.CategoryModes.TryGetValue(kind, out var v) ? v : null;
@@ -662,6 +715,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         "fixed" => 0,
         "auto" => 1,
         "seer" => 2,
+        "off" => 3,
         _ => -1
     };
 
@@ -686,6 +740,7 @@ internal sealed class SettingsForm : Form, IMessageFilter
         {
             1 => "auto",
             2 => "seer",
+            3 => "off",
             _ => "fixed"
         };
         if (dict.Count == 0) _work.Geometry.CategoryModes = null;
@@ -711,10 +766,11 @@ internal sealed class SettingsForm : Form, IMessageFilter
     /// </summary>
     private SettingRow CategoryFixedRow(string kind)
     {
-        const int minW = 320, minH = 240, maxW = 7680, maxH = 4320;
+        // 下限 = Seer 最小窗口（更小的值 Seer 会硬夹回，不生效）
+        const int minW = 765, minH = 645, maxW = 7680, maxH = 4320;
         var (w0, h0) = CurrentCategorySize(kind);
-        var tW = new WrapLabel { Text = "宽", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
-        var tH = new WrapLabel { Text = "高", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
+        var tW = new WrapLabel { Text = "长", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
+        var tH = new WrapLabel { Text = "宽", Font = Theme.BodyStrong, ForeColor = Theme.Muted, BackColor = Color.Transparent };
         var sW = new SliderControl { Minimum = minW, Maximum = maxW, Step = 5, Value = Math.Clamp(w0, minW, maxW) };
         var sH = new SliderControl { Minimum = minH, Maximum = maxH, Step = 5, Value = Math.Clamp(h0, minH, maxH) };
         var nW = new NumberField(sW.Value, minW, maxW, 5, "px");
@@ -1047,7 +1103,8 @@ internal sealed class SettingsForm : Form, IMessageFilter
     {
         var host = new ScrollHost { Dock = DockStyle.Fill, BackColor = Theme.Bg };
         var stack = new Stack(host, S(RowPad), S(CardMargin), S(MinPageW), S);
-        host.ViewportChanged += (_, _) => stack.Reflow();
+        // 窗口宽度没变的 ViewportChanged（竖向拖拽等）跳过整卡重排；显式改过行可见性/内容时走 Reflow() 强制
+        host.ViewportChanged += (_, _) => stack.OnHostResized();
         return (host, stack);
     }
 
@@ -1154,8 +1211,19 @@ internal sealed class SettingsForm : Form, IMessageFilter
 
         public void Finish() => Reflow();
 
-        /// <summary>按当前可视宽度重排整页。</summary>
+        /// <summary>行可见性 / 内容被显式改过：所有卡片下一次重排不能跳过。</summary>
         public void Reflow()
+        {
+            foreach (var (c, _) in _items)
+                if (c is CardPanel card) card.InvalidateLayout();
+            ReflowCore();
+        }
+
+        /// <summary>宿主尺寸变了：宽度没变的卡片直接跳过（拖拽时大部分成本都在这）。</summary>
+        public void OnHostResized() => ReflowCore();
+
+        /// <summary>按当前可视宽度重排整页。</summary>
+        private void ReflowCore()
         {
             int avail = _host.ClientSize.Width - _host.BarWidth - _margin * 2;
             int w = Math.Max(_minWidth, avail);

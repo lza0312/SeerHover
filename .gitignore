@@ -23,3 +23,4 @@ desktop.ini
 # 诊断产物（截图 / dump，gen_test_avi.py 保留）
 work/*.png
 work/*.jpg
+work/*.exe
